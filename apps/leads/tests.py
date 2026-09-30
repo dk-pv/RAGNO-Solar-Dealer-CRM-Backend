@@ -25,7 +25,7 @@ S = LeadStatus
 
 
 def grant(user, *codenames):
-    user.user_permissions.add(*Permission.objects.filter(content_type__app_label='leads', codename__in=codenames))
+    user.role.permissions.add(*Permission.objects.filter(content_type__app_label='leads', codename__in=codenames))
     # Django caches permissions per instance, so hand back a fresh one.
     return User.objects.get(pk=user.pk)
 

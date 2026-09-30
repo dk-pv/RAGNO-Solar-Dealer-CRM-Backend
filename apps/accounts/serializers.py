@@ -1,52 +1,99 @@
 from django.contrib.auth.models import Permission
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db.models import Q
 from rest_framework import serializers
 
 from .models import Department, Role, User
+from .permissions import MODULES
 
 
-class PermissionField(serializers.RelatedField):
-    """A Django permission as "app_label.codename", the same string user.has_perm() takes."""
+def permission_name(permission):
+    return f'{permission.content_type.app_label}.{permission.codename}'
 
-    default_error_messages = {'does_not_exist': 'Unknown permission "{value}".'}
 
-    def to_representation(self, value):
-        return f'{value.content_type.app_label}.{value.codename}'
+class ModulesField(serializers.ListField):
+    """The modules a role (or a user, through their role) can open, as MODULES keys.
+    Written keys are resolved to the modules' permissions."""
+
+    child = serializers.ChoiceField(choices=list(MODULES))
+
+    def get_attribute(self, instance):
+        return instance if isinstance(instance, Role) else instance.role
+
+    def to_representation(self, role):
+        if role.pk == Role.ADMIN:
+            return list(MODULES)
+        # Read from the prefetched permissions, so a list doesn't query each role's permissions.
+        held = {permission_name(permission) for permission in role.permissions.all()}
+        return [key for key, module in MODULES.items() if held.issuperset(module['permissions'])]
 
     def to_internal_value(self, data):
-        # CharField validation rejects non-strings, NUL and surrogate characters before they reach the database.
-        app_label, _, codename = serializers.CharField().run_validation(data).partition('.')
-        try:
-            return self.get_queryset().get(content_type__app_label=app_label, codename=codename)
-        except Permission.DoesNotExist:
-            self.fail('does_not_exist', value=data)
+        permissions = []
+        for key in dict.fromkeys(super().to_internal_value(data)):
+            names = MODULES[key]['permissions']
+            match = Q()
+            for name in names:
+                app_label, _, codename = name.partition('.')
+                match |= Q(content_type__app_label=app_label, codename=codename)
+            found = list(Permission.objects.filter(match))
+            # A module whose app isn't migrated yet has no permissions: refuse it rather than grant part of it.
+            if len(found) != len(names):
+                raise serializers.ValidationError(
+                    f"{MODULES[key]['label']} access can't be given yet: that module isn't set up on the server."
+                )
+            permissions += found
+        return permissions
+
+
+class RoleSerializer(serializers.ModelSerializer):
+    label = serializers.CharField(source='get_name_display', read_only=True)
+    modules = ModulesField(required=False)
+
+    class Meta:
+        model = Role
+        fields = ['name', 'label', 'description', 'modules']
+        read_only_fields = ['name', 'description']
+
+    def validate(self, attrs):
+        # ADMIN holds every permission through User.has_perm, so an admin can never be locked out of Settings.
+        if self.instance.pk == Role.ADMIN and 'modules' in attrs:
+            raise serializers.ValidationError({'modules': "Admins always have every module, so their access can't change."})
+        return attrs
+
+    def update(self, role, validated_data):
+        if 'modules' in validated_data:
+            role.permissions.set(validated_data['modules'])
+            role.save(update_fields=['updated_at'])
+        return role
 
 
 class UserSerializer(serializers.ModelSerializer):
     # Declared explicitly so uniqueness is checked on the normalized value in validate_email().
     email = serializers.EmailField(max_length=254)
     password = serializers.CharField(write_only=True, required=False, trim_whitespace=False)
+    # Only catches a mistyped password: it must match `password` and is never stored.
+    confirm_password = serializers.CharField(write_only=True, required=False, trim_whitespace=False)
     department = serializers.PrimaryKeyRelatedField(
         queryset=Department.objects.all(),
         pk_field=serializers.IntegerField(),
         required=False,
         allow_null=True,
     )
-    permissions = PermissionField(
-        source='user_permissions',
-        many=True,
-        required=False,
-        queryset=Permission.objects.all(),
-    )
+    department_name = serializers.SerializerMethodField()
+    # What the user can open, from their role. Access is changed on the role, never per user.
+    modules = ModulesField(read_only=True)
 
     class Meta:
         model = User
         fields = [
-            'id', 'name', 'email', 'phone', 'role', 'department', 'is_active',
-            'permissions', 'password', 'created_at', 'updated_at',
+            'id', 'name', 'email', 'phone', 'role', 'department', 'department_name', 'is_active',
+            'modules', 'password', 'confirm_password', 'created_at', 'updated_at',
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
+
+    def get_department_name(self, user):
+        return user.department.name if user.department else None
 
     def validate_email(self, value):
         email = User.objects.normalize_email(value)
@@ -64,12 +111,13 @@ class UserSerializer(serializers.ModelSerializer):
         return department
 
     def validate(self, attrs):
+        confirm_password = attrs.pop('confirm_password', None)
         if self.instance is None and not attrs.get('password'):
             raise serializers.ValidationError({'password': 'This field is required.'})
 
         # Blocks the only ways an admin could lock themselves (or the last admin) out.
         if self.instance is not None and self.instance == self.context['request'].user:
-            if attrs.get('role', Role.ADMIN) != Role.ADMIN or attrs.get('is_active') is False:
+            if getattr(attrs.get('role'), 'pk', Role.ADMIN) != Role.ADMIN or attrs.get('is_active') is False:
                 raise serializers.ValidationError(
                     'You cannot remove your own admin role or deactivate your own account.'
                 )
@@ -84,19 +132,18 @@ class UserSerializer(serializers.ModelSerializer):
                 validate_password(attrs['password'], candidate)
             except DjangoValidationError as exc:
                 raise serializers.ValidationError({'password': exc.messages})
+            if confirm_password != attrs['password']:
+                raise serializers.ValidationError({'confirm_password': 'Enter the same password again.'})
         return attrs
 
     def create(self, validated_data):
-        permissions = validated_data.pop('user_permissions', [])
-        user = User.objects.create_user(**validated_data)
-        user.user_permissions.set(permissions)
-        return user
+        return User.objects.create_user(**validated_data)
 
     def update(self, instance, validated_data):
         password = validated_data.pop('password', None)
         if password:
             instance.set_password(password)
-        if validated_data.get('role') == Role.STAFF:
+        if getattr(validated_data.get('role'), 'pk', None) == Role.STAFF:
             # A createsuperuser account would otherwise keep every permission through is_superuser.
             instance.is_superuser = instance.is_staff = False
         return super().update(instance, validated_data)
