@@ -4,6 +4,8 @@ from decimal import Decimal
 from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
+from apps.accounts.models import Role
+
 from .models import Lead, LeadSource, LeadStatus, SolarPlan
 
 User = get_user_model()
@@ -33,6 +35,12 @@ class LeadSerializer(serializers.ModelSerializer):
     assigned_to_name = serializers.SerializerMethodField()
     created_by_name = serializers.SerializerMethodField()
     allowed_transitions = serializers.SerializerMethodField()
+    # What the signed-in user may do with this lead, so the screens match what the API allows. Visibility is already
+    # limited to their own leads for staff, so these follow from the role's permissions.
+    can_edit = serializers.SerializerMethodField()
+    can_delete = serializers.SerializerMethodField()
+    can_assign = serializers.SerializerMethodField()
+    can_convert = serializers.SerializerMethodField()
 
     class Meta:
         model = Lead
@@ -40,7 +48,7 @@ class LeadSerializer(serializers.ModelSerializer):
             'id', 'name', 'country_code', 'phone', 'email', 'state', 'district', 'area', 'pin_code',
             'plan', 'plan_name', 'amount', 'status', 'allowed_transitions', 'source',
             'assigned_to', 'assigned_to_name', 'next_follow_up', 'notes', 'is_pinned',
-            'created_by_name', 'created_at', 'updated_at',
+            'can_edit', 'can_delete', 'can_assign', 'can_convert', 'created_by_name', 'created_at', 'updated_at',
         ]
         # The status changes only through the status and convert actions, which apply the pipeline rules.
         read_only_fields = ['id', 'status', 'created_at', 'updated_at']
@@ -74,8 +82,29 @@ class LeadSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError('Select an active plan.')
         return plan
 
+    def get_can_edit(self, lead):
+        return self.context['request'].user.has_perm('leads.change_lead')
+
+    def get_can_delete(self, lead):
+        return self.context['request'].user.has_perm('leads.delete_lead')
+
+    def get_can_assign(self, lead):
+        return self.context['request'].user.role_id == Role.ADMIN
+
+    def get_can_convert(self, lead):
+        # Converting needs both: a Won lead (convert() checks the status) and someone who can change it.
+        return lead.status == LeadStatus.WON and self.get_can_edit(lead)
+
     def validate_assigned_to(self, user):
-        if user and not user.is_active and user != getattr(self.instance, 'assigned_to', None):
+        current = getattr(self.instance, 'assigned_to', None)
+        requester = self.context['request'].user
+        if requester.role_id != Role.ADMIN:
+            # Staff can't hand a lead to someone else: a new lead is theirs, an existing one keeps its assignee.
+            keep = current if self.instance else requester
+            if user != keep and not (self.instance is None and user is None):
+                raise serializers.ValidationError('Only an admin can assign a lead to someone else.')
+            return keep
+        if user and not user.is_active and user != current:
             raise serializers.ValidationError('Select an active user.')
         return user
 
