@@ -33,13 +33,15 @@ class LeadSerializer(serializers.ModelSerializer):
     assigned_to_name = serializers.SerializerMethodField()
     created_by_name = serializers.SerializerMethodField()
     allowed_transitions = serializers.SerializerMethodField()
+    # The Work created by converting the lead; null until it is converted.
+    work = serializers.PrimaryKeyRelatedField(read_only=True)
 
     class Meta:
         model = Lead
         fields = [
             'id', 'name', 'country_code', 'phone', 'email', 'state', 'district', 'area', 'pin_code',
             'plan', 'plan_name', 'amount', 'status', 'allowed_transitions', 'source',
-            'assigned_to', 'assigned_to_name', 'next_follow_up', 'notes', 'is_pinned',
+            'assigned_to', 'assigned_to_name', 'next_follow_up', 'notes', 'is_pinned', 'work',
             'created_by_name', 'created_at', 'updated_at',
         ]
         # The status changes only through the status and convert actions, which apply the pipeline rules.

@@ -102,7 +102,7 @@ class LeadViewSet(
     lookup_value_regex = '[0-9]+'
 
     def get_queryset(self):
-        leads = Lead.objects.select_related('plan', 'assigned_to', 'created_by')
+        leads = Lead.objects.select_related('plan', 'assigned_to', 'created_by', 'work')
         if self.action in ('list', 'export'):
             return filter_leads(leads, self.request.query_params)
         return leads

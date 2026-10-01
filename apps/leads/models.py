@@ -140,7 +140,11 @@ class Lead(models.Model):
                 raise LeadConflict('This lead has already been converted.')
             if LeadStatus.WON not in lead.allowed_transitions():
                 raise LeadConflict('Only Superhot leads can be converted.')
-            # Creating the Work belongs to the Works module (HRITHIK), which isn't in this codebase yet. Once it is,
-            # create the Work here through that module for `user` (copying the customer, plan and lead.amount), then
-            # set status to WON and save. Until then conversion is refused instead of leaving a Won lead with no Work.
-            raise LeadConflict("Converting creates the lead's Work, and the Works module isn't available yet.")
+            # The Works module copies the customer, plan and lead.amount into the Work. Imported here because the
+            # Works module depends on leads, not the other way round.
+            from apps.works.models import Work
+
+            work = Work.create_for_lead(lead, user)
+            lead.status = LeadStatus.WON
+            lead.save(update_fields=['status', 'updated_at'])
+        self.status, self.updated_at, self.work = lead.status, lead.updated_at, work

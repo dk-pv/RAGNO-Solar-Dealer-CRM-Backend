@@ -6,8 +6,8 @@ from .models import Role
 # the STAFF role a module in Settings → Roles & Access grants exactly what the backend enforces. ADMIN has every module.
 # Every permission listed must be a real, migrated permission.
 MODULES = {
-    # Dashboard, Work, Activities and Reports have no backend yet: their APIs must check these access permissions
-    # (for example user.has_perm('accounts.access_work')) when they are built.
+    # Modules without models of their own use one access permission. The Work API checks accounts.access_work;
+    # Dashboard, Activities and Reports have no backend yet and must check theirs when they are built.
     'dashboard': {'label': 'Dashboard', 'permissions': ['accounts.access_dashboard']},
     'leads': {'label': 'Leads', 'permissions': ['leads.view_lead', 'leads.add_lead', 'leads.change_lead']},
     'work': {'label': 'Work', 'permissions': ['accounts.access_work']},
