@@ -145,10 +145,15 @@ class Lead(models.Model):
         with transaction.atomic():
             # Locked, so two conversions of the same lead run one after the other and can't both create a Work.
             lead = Lead.objects.select_for_update().get(pk=self.pk)
-            if lead.status != LeadStatus.WON:
-                raise LeadConflict(f'Only Won leads can be converted. This lead is {lead.get_status_display()}.')
-            # Creating the Work belongs to the Works module (HRITHIK), which isn't in this codebase yet. Once it is, the
-            # Work links to its lead with a one-to-one field, so the database itself refuses a second Work for a lead:
-            # return the lead's Work if it already has one, otherwise create it here through that module for `user`
-            # (copying the customer, plan and lead.amount). Until then conversion is refused and the lead stays Won.
-            raise LeadConflict("Converting creates the lead's Work, and the Works module isn't available yet.")
+            if lead.status == LeadStatus.WON:
+                raise LeadConflict('This lead has already been converted.')
+            if LeadStatus.WON not in lead.allowed_transitions():
+                raise LeadConflict('Only Superhot leads can be converted.')
+            # The Works module copies the customer, plan and lead.amount into the Work. Imported here because the
+            # Works module depends on leads, not the other way round.
+            from apps.works.models import Work
+
+            work = Work.create_for_lead(lead, user)
+            lead.status = LeadStatus.WON
+            lead.save(update_fields=['status', 'updated_at'])
+        self.status, self.updated_at, self.work = lead.status, lead.updated_at, work

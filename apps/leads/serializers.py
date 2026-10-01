@@ -35,6 +35,8 @@ class LeadSerializer(serializers.ModelSerializer):
     assigned_to_name = serializers.SerializerMethodField()
     created_by_name = serializers.SerializerMethodField()
     allowed_transitions = serializers.SerializerMethodField()
+    # The Work created by converting the lead; null until it is converted.
+    work = serializers.PrimaryKeyRelatedField(read_only=True)
     # What the signed-in user may do with this lead, so the screens match what the API allows. Visibility is already
     # limited to their own leads for staff, so these follow from the role's permissions.
     can_edit = serializers.SerializerMethodField()
@@ -47,6 +49,8 @@ class LeadSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'name', 'country_code', 'phone', 'email', 'state', 'district', 'area', 'pin_code',
             'plan', 'plan_name', 'amount', 'status', 'allowed_transitions', 'source',
+            'assigned_to', 'assigned_to_name', 'next_follow_up', 'notes', 'is_pinned', 'work',
+            'created_by_name', 'created_at', 'updated_at',
             'assigned_to', 'assigned_to_name', 'next_follow_up', 'notes', 'is_pinned',
             'can_edit', 'can_delete', 'can_assign', 'can_convert', 'created_by_name', 'created_at', 'updated_at',
         ]
