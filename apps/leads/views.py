@@ -2,17 +2,18 @@ import csv
 import re
 
 from django.contrib.auth import get_user_model
-from django.db.models import Case, F, IntegerField, Q, Value, When
+from django.db.models import Case, F, IntegerField, ProtectedError, Q, Value, When
 from django.db.models.functions import Concat
 from django.http import HttpResponse
 from django.utils import timezone
-from rest_framework import mixins, viewsets
+from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.generics import ListAPIView
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.response import Response
 
+from apps.accounts.models import Role
 from apps.accounts.permissions import IsAdminRole, ModelPermissions
 
 from .models import Lead, LeadStatus, SolarPlan
@@ -94,15 +95,18 @@ class LeadViewSet(
     mixins.CreateModelMixin,
     mixins.RetrieveModelMixin,
     mixins.UpdateModelMixin,
+    mixins.DestroyModelMixin,
     viewsets.GenericViewSet,
 ):
-    # No delete: a lead keeps its history, and Lost is how a lead is closed.
+    # Who can do what: the role gives the permission (an admin has all; staff get the Leads module's view, add and
+    # change, but not delete) and Lead.objects.visible_to() limits staff to the leads assigned to them. A lead outside
+    # that set answers 404 for every action, so staff can't read, change, convert or even detect another person's lead.
     serializer_class = LeadSerializer
     pagination_class = LeadPagination
     lookup_value_regex = '[0-9]+'
 
     def get_queryset(self):
-        leads = Lead.objects.select_related('plan', 'assigned_to', 'created_by')
+        leads = Lead.objects.visible_to(self.request.user).select_related('plan', 'assigned_to', 'created_by')
         if self.action in ('list', 'export'):
             return filter_leads(leads, self.request.query_params)
         return leads
@@ -118,7 +122,19 @@ class LeadViewSet(
         return [ModelPermissions()]
 
     def perform_create(self, serializer):
-        serializer.save(created_by=self.request.user)
+        user = self.request.user
+        # A lead staff add is theirs: assigned to them, so it stays in their list. Admins assign anyone.
+        extra = {} if user.role_id == Role.ADMIN else {'assigned_to': user}
+        serializer.save(created_by=user, **extra)
+
+    def destroy(self, request, *args, **kwargs):
+        try:
+            return super().destroy(request, *args, **kwargs)
+        except ProtectedError:
+            return Response(
+                {'detail': "This lead has records that depend on it, such as its Work, so it can't be deleted."},
+                status=status.HTTP_409_CONFLICT,
+            )
 
     @action(detail=True, methods=['post'], url_path='status')
     def change_status(self, request, pk=None):
@@ -156,8 +172,12 @@ class LeadViewSet(
 
     @action(detail=False, methods=['get'])
     def assignees(self, request):
-        """The active users a lead can be assigned to: only ids and names."""
-        return Response(list(User.objects.filter(is_active=True).order_by('name', 'id').values('id', 'name')))
+        """Who a lead can be assigned to, as ids and names: any active user for an admin, only themselves for staff
+        (staff can't reassign leads)."""
+        users = User.objects.filter(is_active=True)
+        if request.user.role_id != Role.ADMIN:
+            users = users.filter(pk=request.user.pk)
+        return Response(list(users.order_by('name', 'id').values('id', 'name')))
 
 
 class SolarPlanListView(ListAPIView):
