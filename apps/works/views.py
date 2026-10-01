@@ -2,13 +2,15 @@ import re
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
-from django.db.models import Case, Count, F, IntegerField, Q, Sum, Value, When
+from django.db.models import Case, Count, F, IntegerField, Min, Q, Sum, Value, When
 from django.db.models.functions import Concat
 from rest_framework import mixins, viewsets
 from rest_framework.decorators import action
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import BasePermission
 from rest_framework.response import Response
+
+from apps.activities.models import ActivityStatus
 
 from .models import Work, WorkStage
 from .serializers import WorkQuerySerializer, WorkSerializer
@@ -20,6 +22,14 @@ STAGE_RANK = Case(
     *(When(stage=value, then=Value(rank)) for rank, value in enumerate(WorkStage.values)),
     output_field=IntegerField(),
 )
+
+_pending = Q(activities__status=ActivityStatus.PENDING)
+# Each Work's activities in brief, in the same query as the Works: no request per card.
+ACTIVITY_STATS = {
+    'activity_count': Count('activities'),
+    'pending_activity_count': Count('activities', filter=_pending),
+    'next_activity_due': Min('activities__due_date', filter=_pending),
+}
 
 
 class CanUseWorks(BasePermission):
@@ -67,13 +77,13 @@ def filter_works(works, query_params):
     ordering = params.get('ordering', '-created_at')
     field = F('stage_rank' if ordering.lstrip('-') == 'stage' else ordering.lstrip('-'))
     order = field.desc(nulls_last=True) if ordering.startswith('-') else field.asc(nulls_last=True)
-    # The id keeps pages stable when many Works share the sorted value.
-    return works.annotate(stage_rank=STAGE_RANK).order_by(order, '-id')
+    # Pinned Works come first; the id keeps pages stable when many Works share the sorted value.
+    return works.annotate(stage_rank=STAGE_RANK).order_by('-is_pinned', order, '-id')
 
 
 class WorkViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.UpdateModelMixin, viewsets.GenericViewSet):
     # No create or delete: converting a lead creates its Work, and a Work keeps the job's history.
-    # No PUT: only the stage, assignee and due date change.
+    # No PUT: only the stage, assignee, due date and pin change.
     http_method_names = ['get', 'patch', 'head', 'options']
     serializer_class = WorkSerializer
     permission_classes = [CanUseWorks]
@@ -83,8 +93,9 @@ class WorkViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.Updat
     def get_queryset(self):
         works = Work.objects.select_related('plan', 'assigned_to')
         if self.action in ('list', 'summary'):
-            return filter_works(works, self.request.query_params)
-        return works
+            works = filter_works(works, self.request.query_params)
+        # Not for the summary: joining the activities would count each Work's amount once per activity.
+        return works if self.action == 'summary' else works.annotate(**ACTIVITY_STATS)
 
     @action(detail=False)
     def summary(self, request):

@@ -17,15 +17,20 @@ class WorkSerializer(serializers.ModelSerializer):
     )
     plan_name = serializers.SerializerMethodField()
     assigned_to_name = serializers.SerializerMethodField()
+    # The Work's activities in brief, for the cards and the list (annotated by the view; the activities API has them all).
+    activity_count = serializers.IntegerField(read_only=True)
+    pending_activity_count = serializers.IntegerField(read_only=True)
+    next_activity_due = serializers.DateField(read_only=True)  # the earliest due date among the pending activities
 
     class Meta:
         model = Work
         fields = [
             'id', 'lead', 'customer_name', 'country_code', 'phone', 'email', 'state', 'district', 'area', 'pin_code',
-            'plan', 'plan_name', 'amount', 'stage', 'assigned_to', 'assigned_to_name', 'due_date',
-            'created_at', 'updated_at',
+            'plan', 'plan_name', 'amount', 'stage', 'assigned_to', 'assigned_to_name', 'due_date', 'is_pinned',
+            'activity_count', 'pending_activity_count', 'next_activity_due', 'created_at', 'updated_at',
         ]
-        # The customer, plan and confirmed amount are the job's record from conversion: only the pipeline fields change.
+        # The customer, plan and confirmed amount are the job's record from conversion: only the pipeline fields and the
+        # pin change.
         read_only_fields = [
             'id', 'lead', 'customer_name', 'country_code', 'phone', 'email', 'state', 'district', 'area', 'pin_code',
             'plan', 'amount', 'created_at', 'updated_at',
