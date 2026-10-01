@@ -3,6 +3,8 @@ from django.core.validators import MinValueValidator, RegexValidator
 from django.db import models, transaction
 from rest_framework.exceptions import APIException
 
+from apps.accounts.models import Role
+
 
 class LeadConflict(APIException):
     """A status change or conversion that the lead's current state doesn't allow. The API answers 409."""
@@ -54,6 +56,13 @@ class SolarPlan(models.Model):
         return self.name
 
 
+class LeadQuerySet(models.QuerySet):
+    def visible_to(self, user):
+        """The leads a user works with: every lead for an admin, only the leads assigned to them for staff.
+        What they may do with those leads still comes from their role (the Leads module's permissions)."""
+        return self if user.role_id == Role.ADMIN else self.filter(assigned_to=user)
+
+
 class Lead(models.Model):
     name = models.CharField(max_length=150)
     # Kept apart from the number, so WhatsApp and call links never guess the country: "91" + "9876543210".
@@ -95,6 +104,8 @@ class Lead(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    objects = LeadQuerySet.as_manager()
+
     class Meta:
         constraints = [
             models.CheckConstraint(condition=models.Q(status__in=LeadStatus.values), name='leads_lead_status_valid'),
@@ -110,21 +121,17 @@ class Lead(models.Model):
         return self.name
 
     def allowed_transitions(self):
-        """Forward to any later stage, to Lost from any open stage, and to Won (by conversion) from Superhot.
+        """From any open stage: forward to any later stage, to Won, or to Lost.
         Won and Lost are final: a lead is never moved back or reopened."""
         if self.status not in PIPELINE:
             return []
-        later = PIPELINE[PIPELINE.index(self.status) + 1:]
-        won = [LeadStatus.WON] if self.status == LeadStatus.SUPERHOT else []
-        return [*later, *won, LeadStatus.LOST]
+        return [*PIPELINE[PIPELINE.index(self.status) + 1:], LeadStatus.WON, LeadStatus.LOST]
 
     def move_to(self, new_status):
-        """Moves the lead through the pipeline. Won is reached only by convert(), which also creates the Work."""
+        """Moves the lead through the pipeline. Reaching Won doesn't create the Work: convert() does that next."""
         with transaction.atomic():
             # Locked, so two people changing the same lead can't both act on its old status.
             lead = Lead.objects.select_for_update().get(pk=self.pk)
-            if new_status == LeadStatus.WON:
-                raise LeadConflict('Use Convert to mark a lead Won; converting also creates its Work.')
             if new_status not in lead.allowed_transitions():
                 label = dict(LeadStatus.choices).get(new_status, new_status)
                 raise LeadConflict(f"A {lead.get_status_display()} lead can't move to {label}.")
@@ -133,8 +140,10 @@ class Lead(models.Model):
         self.status, self.updated_at = lead.status, lead.updated_at
 
     def convert(self, user):
-        """Marks the lead Won and creates its Work in one transaction, so no lead is ever Won without its Work."""
+        """Creates the Work for a Won lead. Only Won leads convert, and converting never changes the lead's status:
+        whoever works the lead moves it to Won first."""
         with transaction.atomic():
+            # Locked, so two conversions of the same lead run one after the other and can't both create a Work.
             lead = Lead.objects.select_for_update().get(pk=self.pk)
             if lead.status == LeadStatus.WON:
                 raise LeadConflict('This lead has already been converted.')

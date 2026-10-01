@@ -336,7 +336,7 @@ class UserApiTests(APITestCase):
         self.assertFalse(User.objects.filter(pk=self.staff.pk).exists())
 
     def test_staff_with_crm_records_admins_and_staff_requests_cannot_delete(self):
-        plan = SolarPlan.objects.create(name='3 kW', capacity=3, amount=180000)
+        plan = SolarPlan.objects.get(capacity=3)  # created by the leads data migration
         Lead.objects.create(name='Customer', phone='9876543210', district='Kochi', plan=plan, amount=180000, created_by=self.staff)
         other_staff = User.objects.create_user(email='other@example.com', password=PASSWORD, name='Other')
 

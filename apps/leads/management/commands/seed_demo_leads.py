@@ -210,9 +210,11 @@ class Command(BaseCommand):
                         created_at=created_at, updated_at=created_at + timedelta(days=min(days_ago, 1 + index % 4)),
                     )
                     created += 1
-                # A Won lead needs its Work, so Won is reached only through conversion. Re-running the command after
-                # conversion becomes available converts the ones still waiting.
+                # Won like any status (from Superhot), then converted to create its Work. Re-running the command
+                # converts the Won leads still waiting once conversion is available.
                 if target == S.WON and lead.status == S.SUPERHOT:
+                    lead.move_to(S.WON)
+                if target == S.WON and lead.status == S.WON:
                     try:
                         lead.convert(owner)
                     except LeadConflict as refusal:
@@ -232,6 +234,6 @@ class Command(BaseCommand):
         self.stdout.write('Assigned: ' + ', '.join(f'{name or "Unassigned"} {count}' for name, count in people.items()))
         if not_converted:
             self.stdout.write(self.style.WARNING(
-                f'{len(not_converted)} leads meant to be Won are still Superhot: {not_converted[0][1]} '
+                f'{len(not_converted)} Won leads are not converted to Work yet: {not_converted[0][1]} '
                 'Run this command again once conversion is available and they will be converted.'
             ))

@@ -39,13 +39,13 @@ class LeadModelTests(TestCase):
     @classmethod
     def setUpTestData(cls):
         cls.admin = User.objects.create_user(email='admin@example.com', password=PASSWORD, name='Admin', role=Role.ADMIN)
-        cls.plan = SolarPlan.objects.create(name='5 kW', capacity=5, amount=200000)
+        cls.plan = SolarPlan.objects.get(capacity=5)
 
-    def test_pipeline_moves_forward_to_lost_from_any_open_stage_and_to_won_only_from_superhot(self):
+    def test_pipeline_moves_forward_or_to_won_or_lost_from_any_open_stage(self):
         expected = {
-            S.NEW: [S.INITIAL_CONTACT, S.HOT, S.SUPERHOT, S.LOST],
-            S.INITIAL_CONTACT: [S.HOT, S.SUPERHOT, S.LOST],
-            S.HOT: [S.SUPERHOT, S.LOST],
+            S.NEW: [S.INITIAL_CONTACT, S.HOT, S.SUPERHOT, S.WON, S.LOST],
+            S.INITIAL_CONTACT: [S.HOT, S.SUPERHOT, S.WON, S.LOST],
+            S.HOT: [S.SUPERHOT, S.WON, S.LOST],
             S.SUPERHOT: [S.WON, S.LOST],
             S.WON: [],
             S.LOST: [],
@@ -53,12 +53,12 @@ class LeadModelTests(TestCase):
         for current, allowed in expected.items():
             self.assertEqual(Lead(status=current).allowed_transitions(), allowed, current)
 
-    def test_move_to_saves_forward_moves_and_refuses_going_back_won_and_reopening(self):
+    def test_move_to_saves_forward_moves_and_refuses_going_back_and_reopening(self):
         lead = make_lead(self.plan, self.admin)
         lead.move_to(S.HOT)
         self.assertEqual(Lead.objects.get(pk=lead.pk).status, S.HOT)
 
-        for target in (S.NEW, S.INITIAL_CONTACT, S.WON, 'CONFIRMED'):
+        for target in (S.NEW, S.INITIAL_CONTACT, S.HOT, 'CONFIRMED'):
             with self.assertRaises(LeadConflict):
                 lead.move_to(target)
         lead.move_to(S.LOST)
@@ -66,15 +66,25 @@ class LeadModelTests(TestCase):
             lead.move_to(S.HOT)
         self.assertEqual(Lead.objects.get(pk=lead.pk).status, S.LOST)
 
-    def test_conversion_is_refused_until_the_works_module_exists_and_changes_nothing(self):
-        hot = make_lead(self.plan, self.admin, status=S.HOT)
-        superhot = make_lead(self.plan, self.admin, status=S.SUPERHOT, phone='9876500002')
+    def test_only_won_leads_convert_and_converting_never_changes_the_status(self):
+        for i, current in enumerate((S.NEW, S.INITIAL_CONTACT, S.HOT, S.SUPERHOT, S.LOST)):
+            lead = make_lead(self.plan, self.admin, status=current, phone=f'98765000{i:02d}')
+            with self.assertRaisesMessage(LeadConflict, 'Only Won leads can be converted.'):
+                lead.convert(self.admin)
+            self.assertEqual(Lead.objects.get(pk=lead.pk).status, current)
 
-        with self.assertRaisesMessage(LeadConflict, 'Only Superhot leads can be converted.'):
-            hot.convert(self.admin)
+        won = make_lead(self.plan, self.admin, status=S.SUPERHOT, phone='9876500010')
+        won.move_to(S.WON)
+        # Eligible, so refused only at the Work step until the Works module exists; the lead stays Won.
         with self.assertRaisesMessage(LeadConflict, "the Works module isn't available yet"):
-            superhot.convert(self.admin)
-        self.assertEqual(Lead.objects.get(pk=superhot.pk).status, S.SUPERHOT)
+            won.convert(self.admin)
+        self.assertEqual(Lead.objects.get(pk=won.pk).status, S.WON)
+
+    def test_every_database_has_the_four_plans_at_their_starting_prices(self):
+        self.assertEqual(
+            list(SolarPlan.objects.values_list('name', 'amount', 'is_active')),
+            [('3 kW', 150000, True), ('5 kW', 200000, True), ('8 kW', 245000, True), ('10 kW', 289000, True)],
+        )
 
     def test_a_plan_price_change_never_alters_the_amount_saved_on_a_lead(self):
         lead = make_lead(self.plan, self.admin, amount=Decimal('195000'))
@@ -89,7 +99,7 @@ class LeadApiTests(APITestCase):
     def setUpTestData(cls):
         cls.admin = User.objects.create_user(email='admin@example.com', password=PASSWORD, name='Admin', role=Role.ADMIN)
         cls.staff = User.objects.create_user(email='staff@example.com', password=PASSWORD, name='Staff')
-        cls.plan = SolarPlan.objects.create(name='5 kW', capacity=5, amount=200000)
+        cls.plan = SolarPlan.objects.get(capacity=5)
         cls.retired_plan = SolarPlan.objects.create(name='2 kW', capacity=2, amount=90000, is_active=False)
 
     def setUp(self):
@@ -119,7 +129,7 @@ class LeadApiTests(APITestCase):
         self.assertEqual(self.client.post(reverse('lead-convert', args=[lead.pk])).status_code, 401)
 
     def test_staff_access_follows_granted_lead_permissions(self):
-        lead = make_lead(self.plan, self.admin)
+        lead = make_lead(self.plan, self.admin, assigned_to=self.staff)
         status_url = reverse('lead-change-status', args=[lead.pk])
 
         self.client.force_authenticate(self.staff)
@@ -146,7 +156,7 @@ class LeadApiTests(APITestCase):
         self.assertEqual((lead.status, lead.created_by, lead.amount), (S.NEW, self.admin, Decimal('200000')))
         self.assertEqual(response.data['status'], 'NEW')
         self.assertEqual(response.data['plan_name'], '5 kW')
-        self.assertEqual(response.data['allowed_transitions'], ['INITIAL_CONTACT', 'HOT', 'SUPERHOT', 'LOST'])
+        self.assertEqual(response.data['allowed_transitions'], ['INITIAL_CONTACT', 'HOT', 'SUPERHOT', 'WON', 'LOST'])
 
     def test_create_keeps_a_custom_amount_and_normalizes_the_phone_number(self):
         response = self.post_lead(phone='098765 43210', amount='195000.50')
@@ -234,7 +244,7 @@ class LeadApiTests(APITestCase):
         self.assertEqual(self.listed(search='nobody'), [])
 
     def test_filters_combine_and_unknown_values_are_rejected(self):
-        plan3 = SolarPlan.objects.create(name='3 kW', capacity=3, amount=150000)
+        plan3 = SolarPlan.objects.get(capacity=3)
         hot = make_lead(self.plan, self.admin, status=S.HOT, source='REFERRAL', assigned_to=self.staff)
         old = make_lead(plan3, self.admin, phone='9876500002')
         Lead.objects.filter(pk=old.pk).update(created_at=timezone.now() - timedelta(days=10))
@@ -287,8 +297,6 @@ class LeadApiTests(APITestCase):
         self.assertEqual((response.status_code, response.data['status']), (status.HTTP_200_OK, 'SUPERHOT'))
         self.assertEqual(response.data['allowed_transitions'], ['WON', 'LOST'])
         self.assertEqual(self.client.post(url, {'status': 'HOT'}, format='json').status_code, status.HTTP_409_CONFLICT)
-        won = self.client.post(url, {'status': 'WON'}, format='json')
-        self.assertEqual((won.status_code, won.data['detail']), (409, 'Use Convert to mark a lead Won; converting also creates its Work.'))
         for invalid in ('CONFIRMED', 'Site Visit', 'won', ''):
             self.assertEqual(self.client.post(url, {'status': invalid}, format='json').status_code, 400, invalid)
 
@@ -297,16 +305,30 @@ class LeadApiTests(APITestCase):
         self.assertEqual(Lead.objects.get(pk=lead.pk).status, S.LOST)
         self.assertEqual(self.listed(status='LOST'), [lead.pk])
 
-    def test_convert_is_a_server_operation_that_refuses_until_the_works_module_exists(self):
-        hot = make_lead(self.plan, self.admin, status=S.HOT)
-        superhot = make_lead(self.plan, self.admin, status=S.SUPERHOT, phone='9876500002')
+        # Won is an ordinary move from Superhot, and final like Lost.
+        won = make_lead(self.plan, self.admin, status=S.SUPERHOT, phone='9876500002')
+        url = reverse('lead-change-status', args=[won.pk])
+        response = self.client.post(url, {'status': 'WON'}, format='json')
+        self.assertEqual((response.status_code, response.data['status'], response.data['allowed_transitions']), (200, 'WON', []))
+        self.assertEqual(self.client.post(url, {'status': 'LOST'}, format='json').status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(Lead.objects.get(pk=won.pk).status, S.WON)
 
-        response = self.client.post(reverse('lead-convert', args=[hot.pk]))
-        self.assertEqual((response.status_code, response.data['detail']), (409, 'Only Superhot leads can be converted.'))
-        response = self.client.post(reverse('lead-convert', args=[superhot.pk]))
+    def test_the_api_converts_only_won_leads_whatever_a_client_sends(self):
+        for i, current in enumerate((S.NEW, S.INITIAL_CONTACT, S.HOT, S.SUPERHOT, S.LOST)):
+            lead = make_lead(self.plan, self.admin, status=current, phone=f'98765000{i:02d}')
+            self.assertFalse(self.client.get(reverse('lead-detail', args=[lead.pk])).data['can_convert'], current)
+            response = self.client.post(reverse('lead-convert', args=[lead.pk]))
+            self.assertEqual(response.status_code, status.HTTP_409_CONFLICT, current)
+            self.assertIn('Only Won leads can be converted.', response.data['detail'])
+            self.assertEqual(Lead.objects.get(pk=lead.pk).status, current)
+
+        won = make_lead(self.plan, self.admin, status=S.WON, phone='9876500010')
+        self.assertTrue(self.client.get(reverse('lead-detail', args=[won.pk])).data['can_convert'])
+        response = self.client.post(reverse('lead-convert', args=[won.pk]))
+        # Eligible, so refused only at the Work step until the Works module exists; the lead stays Won.
         self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
         self.assertIn("the Works module isn't available yet", response.data['detail'])
-        self.assertEqual(Lead.objects.get(pk=superhot.pk).status, S.SUPERHOT)
+        self.assertEqual(Lead.objects.get(pk=won.pk).status, S.WON)
 
     def test_export_is_an_admin_only_csv_that_follows_the_filters_and_neutralizes_formulas(self):
         make_lead(self.plan, self.admin, name='=HYPERLINK("http://example.com")', status=S.HOT)
@@ -330,6 +352,9 @@ class LeadApiTests(APITestCase):
         self.assertEqual(response.data, [{'id': self.admin.pk, 'name': 'Admin'}, {'id': self.staff.pk, 'name': 'Staff'}])
         self.client.force_authenticate(self.staff)
         self.assertEqual(self.client.get(reverse('lead-assignees')).status_code, status.HTTP_403_FORBIDDEN)
+        # Staff can't reassign leads, so the only assignee they're offered is themselves.
+        self.client.force_authenticate(grant(self.staff, 'view_lead'))
+        self.assertEqual(self.client.get(reverse('lead-assignees')).data, [{'id': self.staff.pk, 'name': 'Staff'}])
 
     def test_plans_list_every_plan_with_its_current_price_for_any_signed_in_user(self):
         self.client.force_authenticate(self.staff)
@@ -339,9 +364,183 @@ class LeadApiTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(
             [(plan['name'], plan['amount'], plan['is_active']) for plan in response.data],
-            [('2 kW', '90000.00', False), ('5 kW', '200000.00', True)],
+            [
+                ('2 kW', '90000.00', False), ('3 kW', '150000.00', True), ('5 kW', '200000.00', True),
+                ('8 kW', '245000.00', True), ('10 kW', '289000.00', True),
+            ],
         )
 
+
+class LeadAccessTests(APITestCase):
+    """Admins work with every lead; staff with the Leads module work only with the leads assigned to them."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.admin = User.objects.create_user(email='admin@example.com', password=PASSWORD, name='Admin', role=Role.ADMIN)
+        cls.staff_a = User.objects.create_user(email='a@example.com', password=PASSWORD, name='Staff A')
+        cls.staff_b = User.objects.create_user(email='b@example.com', password=PASSWORD, name='Staff B')
+        # The Leads module, as an admin gives it to the STAFF role in Settings -> Roles & Access.
+        grant(cls.staff_a, 'view_lead', 'add_lead', 'change_lead')
+        cls.plan = SolarPlan.objects.get(capacity=5)
+
+    def setUp(self):
+        self.a_lead = make_lead(self.plan, self.admin, name='A Lead', assigned_to=self.staff_a, status=S.SUPERHOT)
+        self.b_lead = make_lead(self.plan, self.admin, name='B Lead', phone='9876500002', assigned_to=self.staff_b)
+        self.unassigned = make_lead(self.plan, self.admin, name='Pool Lead', phone='9876500003')
+
+    def as_user(self, user):
+        self.client.force_authenticate(User.objects.get(pk=user.pk))
+
+    def names(self):
+        return sorted(row['name'] for row in self.client.get(reverse('lead-list')).data['results'])
+
+    def calls(self, lead):
+        """Every lead action, each as (label, response)."""
+        detail = reverse('lead-detail', args=[lead.pk])
+        return [
+            ('view', self.client.get(detail)),
+            ('edit', self.client.patch(detail, {'district': 'Kollam'}, format='json')),
+            ('pin', self.client.patch(detail, {'is_pinned': True}, format='json')),
+            ('status', self.client.post(reverse('lead-change-status', args=[lead.pk]), {'status': 'LOST'}, format='json')),
+            ('convert', self.client.post(reverse('lead-convert', args=[lead.pk]))),
+            ('delete', self.client.delete(detail)),
+        ]
+
+    def walk_to_won_then_convert(self, lead):
+        """New -> Initial Contact -> Hot -> Superhot -> Won through the status API, with conversion refused before Won."""
+        detail = reverse('lead-detail', args=[lead.pk])
+        convert_url = reverse('lead-convert', args=[lead.pk])
+        for target in (S.INITIAL_CONTACT, S.HOT, S.SUPERHOT, S.WON):
+            current = self.client.get(detail).data
+            self.assertFalse(current['can_convert'], current['status'])
+            refused = self.client.post(convert_url)
+            self.assertEqual(refused.status_code, status.HTTP_409_CONFLICT, current['status'])
+            self.assertIn('Only Won leads can be converted.', refused.data['detail'])
+            moved = self.client.post(reverse('lead-change-status', args=[lead.pk]), {'status': target}, format='json')
+            self.assertEqual((moved.status_code, moved.data['status']), (200, target))
+            self.assertEqual(Lead.objects.get(pk=lead.pk).status, target)
+        self.assertTrue(self.client.get(detail).data['can_convert'])
+        converted = self.client.post(convert_url)
+        self.assertEqual(converted.status_code, status.HTTP_409_CONFLICT)
+        self.assertIn("the Works module isn't available yet", converted.data['detail'])
+        self.assertEqual(Lead.objects.get(pk=lead.pk).status, S.WON)
+
+    def test_admin_moves_a_lead_assigned_to_someone_else_to_won_and_converts_it(self):
+        self.as_user(self.admin)
+        self.walk_to_won_then_convert(self.b_lead)
+
+    def test_assigned_staff_move_their_lead_to_won_and_convert_it(self):
+        self.as_user(self.staff_a)
+        self.walk_to_won_then_convert(make_lead(self.plan, self.admin, phone='9876500004', assigned_to=self.staff_a))
+
+    def test_the_status_api_checks_the_user_the_lead_and_the_status(self):
+        url = reverse('lead-change-status', args=[self.b_lead.pk])
+        self.as_user(self.admin)
+        for invalid in ('CONFIRMED', 'CONTACTED', 'SITE_VISIT', 'Initial Contact', 'won', ''):
+            self.assertEqual(self.client.post(url, {'status': invalid}, format='json').status_code, 400, invalid)
+        missing = reverse('lead-change-status', args=[999999])
+        self.assertEqual(self.client.post(missing, {'status': 'HOT'}, format='json').status_code, 404)
+        # Another staff member's lead is out of reach, and an unauthenticated request is refused outright.
+        self.as_user(self.staff_a)
+        self.assertEqual(self.client.post(url, {'status': 'WON'}, format='json').status_code, 404)
+        self.client.force_authenticate(None)
+        self.assertEqual(self.client.post(url, {'status': 'WON'}, format='json').status_code, 401)
+        self.assertEqual(Lead.objects.get(pk=self.b_lead.pk).status, S.NEW)
+        # Won straight from New: any open lead can be marked Won, then converted.
+        self.as_user(self.admin)
+        won = self.client.post(url, {'status': 'WON'}, format='json')
+        self.assertEqual((won.status_code, won.data['status'], won.data['can_convert']), (200, 'WON', True))
+
+    def test_admin_works_with_every_lead_and_assignment(self):
+        self.as_user(self.admin)
+        self.assertEqual(self.names(), ['A Lead', 'B Lead', 'Pool Lead'])
+        detail = self.client.get(reverse('lead-detail', args=[self.b_lead.pk])).data
+        self.assertEqual((detail['can_edit'], detail['can_delete'], detail['can_assign']), (True, True, True))
+
+        url = reverse('lead-detail', args=[self.unassigned.pk])
+        response = self.client.patch(
+            url, {'assigned_to': self.staff_a.pk, 'district': 'Kollam', 'is_pinned': True}, format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(Lead.objects.get(pk=self.unassigned.pk).assigned_to, self.staff_a)
+        status_url = reverse('lead-change-status', args=[self.b_lead.pk])
+        self.assertEqual(self.client.post(status_url, {'status': 'HOT'}, format='json').status_code, 200)
+        self.assertEqual(self.client.get(reverse('lead-export')).status_code, status.HTTP_200_OK)
+        self.assertEqual(self.client.delete(reverse('lead-detail', args=[self.b_lead.pk])).status_code, 204)
+        self.assertFalse(Lead.objects.filter(pk=self.b_lead.pk).exists())
+
+    def test_assigned_staff_manage_their_own_leads(self):
+        self.as_user(self.staff_a)
+        self.assertEqual(self.names(), ['A Lead'])
+        detail = self.client.get(reverse('lead-detail', args=[self.a_lead.pk])).data
+        self.assertEqual((detail['can_edit'], detail['can_delete'], detail['can_assign']), (True, False, False))
+        self.assertEqual(detail['allowed_transitions'], ['WON', 'LOST'])
+
+        url = reverse('lead-detail', args=[self.a_lead.pk])
+        self.assertEqual(self.client.patch(url, {'district': 'Kollam', 'is_pinned': True}, format='json').status_code, 200)
+        self.assertEqual(self.client.patch(url, {'is_pinned': False}, format='json').status_code, 200)
+        status_url = reverse('lead-change-status', args=[self.a_lead.pk])
+        self.assertEqual(self.client.post(status_url, {'status': 'LOST'}, format='json').status_code, 200)
+        self.assertEqual(Lead.objects.get(pk=self.a_lead.pk).status, S.LOST)
+
+    def test_staff_cannot_reach_leads_of_other_staff_or_unassigned_leads(self):
+        self.as_user(self.staff_a)
+        for lead in (self.b_lead, self.unassigned):
+            for label, response in self.calls(lead):
+                # Delete is refused before any lead is looked up (staff have no delete permission at all); everything
+                # else answers as if the lead didn't exist.
+                expected = status.HTTP_403_FORBIDDEN if label == 'delete' else status.HTTP_404_NOT_FOUND
+                self.assertEqual(response.status_code, expected, (lead.name, label))
+        b_lead = Lead.objects.get(pk=self.b_lead.pk)
+        self.assertEqual((b_lead.district, b_lead.is_pinned, b_lead.status), ('Ernakulam', False, S.NEW))
+        self.assertEqual(self.client.get(reverse('lead-list'), {'search': 'B Lead'}).data['count'], 0)
+        self.assertEqual(self.client.get(reverse('lead-export')).status_code, status.HTTP_403_FORBIDDEN)
+        # Not even another person's Won lead.
+        won = make_lead(self.plan, self.admin, phone='9876500005', assigned_to=self.staff_b, status=S.WON)
+        self.assertEqual(self.client.post(reverse('lead-convert', args=[won.pk])).status_code, 404)
+
+    def test_staff_cannot_assign_or_reassign_leads(self):
+        self.as_user(self.staff_a)
+        url = reverse('lead-detail', args=[self.a_lead.pk])
+        moved = self.client.patch(url, {'assigned_to': self.staff_b.pk}, format='json')
+        self.assertEqual(moved.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(moved.data['assigned_to'][0], 'Only an admin can assign a lead to someone else.')
+        self.assertEqual(self.client.patch(url, {'assigned_to': None}, format='json').status_code, 400)
+        self.assertEqual(Lead.objects.get(pk=self.a_lead.pk).assigned_to, self.staff_a)
+        # Keeping the current assignee (as the edit form sends it) is fine.
+        self.assertEqual(self.client.patch(url, {'assigned_to': self.staff_a.pk}, format='json').status_code, 200)
+
+        payload = {'name': 'New Lead', 'phone': '9876500009', 'district': 'Thrissur', 'plan': self.plan.pk}
+        handed = self.client.post(reverse('lead-list'), {**payload, 'assigned_to': self.staff_b.pk}, format='json')
+        self.assertEqual(handed.status_code, status.HTTP_400_BAD_REQUEST)
+        created = self.client.post(reverse('lead-list'), payload, format='json')
+        self.assertEqual(created.status_code, status.HTTP_201_CREATED, created.data)
+        lead = Lead.objects.get(pk=created.data['id'])
+        self.assertEqual((lead.assigned_to, lead.created_by), (self.staff_a, self.staff_a))
+        self.assertEqual(self.names(), ['A Lead', 'New Lead'])
+
+    def test_deleting_a_lead_needs_the_delete_permission_which_the_leads_module_does_not_give(self):
+        self.as_user(self.staff_a)
+        self.assertEqual(self.client.delete(reverse('lead-detail', args=[self.a_lead.pk])).status_code, 403)
+        self.assertTrue(Lead.objects.filter(pk=self.a_lead.pk).exists())
+        self.as_user(self.admin)
+        self.assertEqual(self.client.delete(reverse('lead-detail', args=[self.a_lead.pk])).status_code, 204)
+        self.assertEqual(self.client.delete(reverse('lead-detail', args=[self.a_lead.pk])).status_code, 404)
+
+    def test_reassigning_moves_the_lead_between_staff(self):
+        self.as_user(self.admin)
+        url = reverse('lead-detail', args=[self.a_lead.pk])
+        self.assertEqual(self.client.patch(url, {'assigned_to': self.staff_b.pk}, format='json').status_code, 200)
+        self.as_user(self.staff_a)
+        self.assertEqual(self.client.get(url).status_code, status.HTTP_404_NOT_FOUND)
+        self.as_user(self.staff_b)
+        self.assertEqual(self.client.get(url).status_code, status.HTTP_200_OK)
+
+    def test_staff_without_the_leads_module_cannot_open_even_their_own_leads(self):
+        Role.objects.get(name=Role.STAFF).permissions.clear()
+        self.as_user(self.staff_a)
+        self.assertEqual(self.client.get(reverse('lead-list')).status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(self.client.get(reverse('lead-detail', args=[self.a_lead.pk])).status_code, 403)
 
 @override_settings(DEBUG=True)
 class SeedDemoLeadsTests(TestCase):
@@ -364,13 +563,12 @@ class SeedDemoLeadsTests(TestCase):
         self.assertIn('50 added, 0 already present', first)
         self.assertIn('0 added, 50 already present', second)
         self.assertEqual(Lead.objects.count(), 50)
-        # Won needs its Work and conversion is refused until the Works module exists, so the 7 leads meant to be Won
-        # wait as Superhot (8 + 7) instead of becoming Won leads without a Work.
         self.assertEqual(
             Counter(Lead.objects.values_list('status', flat=True)),
-            {S.NEW: 10, S.INITIAL_CONTACT: 9, S.HOT: 9, S.SUPERHOT: 15, S.LOST: 7},
+            {S.NEW: 10, S.INITIAL_CONTACT: 9, S.HOT: 9, S.SUPERHOT: 8, S.WON: 7, S.LOST: 7},
         )
-        self.assertIn('7 leads meant to be Won are still Superhot', second)
+        # Converting creates their Work, which waits for the Works module.
+        self.assertIn('7 Won leads are not converted to Work yet', second)
         self.assertEqual(
             list(SolarPlan.objects.values_list('name', 'amount')),
             [('3 kW', 150000), ('5 kW', 200000), ('8 kW', 245000), ('10 kW', 289000)],
@@ -393,7 +591,7 @@ class SeedDemoLeadsTests(TestCase):
 
     def test_seed_keeps_existing_plan_prices_and_never_touches_a_lead_that_is_not_its_own(self):
         self.add_team()
-        SolarPlan.objects.create(name='5 kW', capacity=5, amount=210000)
+        SolarPlan.objects.filter(capacity=5).update(amount=210000)
         admin = User.objects.get(email='admin@example.com')
         real = make_lead(SolarPlan.objects.get(capacity=5), admin, name='Real Customer', phone=phone_for(0))
 
