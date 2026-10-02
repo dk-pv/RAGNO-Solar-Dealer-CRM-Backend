@@ -2,9 +2,12 @@ import re
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
+from django.db import transaction
 from rest_framework import serializers
 
 from apps.accounts.models import Role
+from apps.activities.models import Activity, ActivityStatus
+from apps.activities.serializers import FollowUpSerializer
 
 from .models import Lead, LeadSource, LeadStatus, SolarPlan
 
@@ -43,6 +46,8 @@ class LeadSerializer(serializers.ModelSerializer):
     can_delete = serializers.SerializerMethodField()
     can_assign = serializers.SerializerMethodField()
     can_convert = serializers.SerializerMethodField()
+    # Add Lead can add the lead's first follow-up too: created with the lead in one transaction, and Pending.
+    initial_follow_up = FollowUpSerializer(required=False, write_only=True)
 
     class Meta:
         model = Lead
@@ -53,6 +58,7 @@ class LeadSerializer(serializers.ModelSerializer):
             'created_by_name', 'created_at', 'updated_at',
             'assigned_to', 'assigned_to_name', 'next_follow_up', 'notes', 'is_pinned',
             'can_edit', 'can_delete', 'can_assign', 'can_convert', 'created_by_name', 'created_at', 'updated_at',
+            'initial_follow_up',
         ]
         # The status changes only through the status and convert actions, which apply the pipeline rules.
         read_only_fields = ['id', 'status', 'created_at', 'updated_at']
@@ -123,9 +129,20 @@ class LeadSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError({'phone': 'Enter a valid phone number for this country code.'})
         return attrs
 
+    def validate_initial_follow_up(self, follow_up):
+        if self.instance:
+            raise serializers.ValidationError("Add follow-ups to an existing lead from its page.")
+        return follow_up
+
     def create(self, validated_data):
+        follow_up = validated_data.pop('initial_follow_up', None)
         validated_data.setdefault('amount', validated_data['plan'].amount)
-        return super().create(validated_data)
+        # Both or neither: a lead is never left without the follow-up it was added with, nor a follow-up without its lead.
+        with transaction.atomic():
+            lead = super().create(validated_data)
+            if follow_up:
+                Activity.objects.create(lead=lead, created_by=lead.created_by, status=ActivityStatus.PENDING, **follow_up)
+        return lead
 
 
 class StatusChangeSerializer(serializers.Serializer):

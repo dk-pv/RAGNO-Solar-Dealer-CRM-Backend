@@ -1,6 +1,10 @@
+import re
+
 from django.conf import settings
 from django.core.validators import MinValueValidator, RegexValidator
 from django.db import models, transaction
+from django.db.models import Q
+from django.db.models.functions import Concat
 from rest_framework.exceptions import APIException
 
 from apps.accounts.models import Role
@@ -61,6 +65,28 @@ class LeadQuerySet(models.QuerySet):
         """The leads a user works with: every lead for an admin, only the leads assigned to them for staff.
         What they may do with those leads still comes from their role (the Leads module's permissions)."""
         return self if user.role_id == Role.ADMIN else self.filter(assigned_to=user)
+
+    def search(self, text, details=True):
+        """The leads a search box entry finds: by name, email, area, district or PIN code; by phone number, with or
+        without its country code, ignoring spaces and a leading 0; or by ID, so "1024" and "#1024" find lead 1024.
+        Without `details`, only by name, phone or ID."""
+        text = text.strip()
+        if not text:
+            return self
+        match = Q(name__icontains=text)
+        if details:
+            match |= (
+                Q(email__icontains=text) | Q(area__icontains=text) | Q(district__icontains=text)
+                | Q(pin_code__icontains=text)
+            )
+        if re.fullmatch(r'[0-9\s()+-]+', text):
+            digits = re.sub(r'[^0-9]', '', text).lstrip('0')
+            if digits:
+                match |= Q(full_phone__contains=digits)
+        lead_id = text.removeprefix('#')
+        if re.fullmatch(r'[0-9]{1,18}', lead_id):
+            match |= Q(pk=int(lead_id))
+        return self.annotate(full_phone=Concat('country_code', 'phone')).filter(match)
 
 
 class Lead(models.Model):
