@@ -16,6 +16,7 @@ from rest_framework import status
 from rest_framework.test import APITestCase
 
 from apps.accounts.models import Role, User
+from apps.activities.models import Activity
 
 from .management.commands.seed_demo_leads import phone_for
 from .models import Lead, LeadConflict, LeadStatus, SolarPlan
@@ -569,6 +570,10 @@ class SeedDemoLeadsTests(TestCase):
         )
         # Converting creates their Work, which waits for the Works module.
         self.assertIn('7 Won leads are not converted to Work yet', second)
+        # Follow-ups on demo leads, to do and done, added once.
+        self.assertIn('Demo follow-ups: 14 added, 14 in total (9 pending, 5 completed).', first)
+        self.assertIn('Demo follow-ups: 0 added, 14 in total (9 pending, 5 completed).', second)
+        self.assertEqual(Activity.objects.count(), 14)
         self.assertEqual(
             list(SolarPlan.objects.values_list('name', 'amount')),
             [('3 kW', 150000), ('5 kW', 200000), ('8 kW', 245000), ('10 kW', 289000)],

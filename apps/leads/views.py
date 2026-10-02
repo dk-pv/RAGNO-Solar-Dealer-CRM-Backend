@@ -1,9 +1,7 @@
 import csv
-import re
 
 from django.contrib.auth import get_user_model
-from django.db.models import Case, F, IntegerField, ProtectedError, Q, Value, When
-from django.db.models.functions import Concat
+from django.db.models import Case, F, IntegerField, ProtectedError, Value, When
 from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework import mixins, status, viewsets
@@ -33,21 +31,7 @@ def filter_leads(leads, query_params):
     query.is_valid(raise_exception=True)
     params = query.validated_data
 
-    if search := params.get('search', '').strip():
-        match = (
-            Q(name__icontains=search) | Q(email__icontains=search) | Q(area__icontains=search)
-            | Q(district__icontains=search) | Q(pin_code__icontains=search)
-        )
-        # A phone-like search matches the number with or without its country code, ignoring spaces and a leading 0.
-        if re.fullmatch(r'[0-9\s()+-]+', search):
-            digits = re.sub(r'[^0-9]', '', search).lstrip('0')
-            if digits:
-                match |= Q(full_phone__contains=digits)
-        # "1024" and "#1024" also find lead 1024.
-        lead_id = search.removeprefix('#')
-        if re.fullmatch(r'[0-9]{1,18}', lead_id):
-            match |= Q(pk=int(lead_id))
-        leads = leads.annotate(full_phone=Concat('country_code', 'phone')).filter(match)
+    leads = leads.search(params.get('search', ''))
 
     for field in ('status', 'source'):
         if field in params:

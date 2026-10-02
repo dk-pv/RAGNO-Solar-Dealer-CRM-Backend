@@ -1,4 +1,4 @@
-"""Adds 50 fictional demo leads for development and demos. Safe to run repeatedly.
+"""Adds 50 fictional demo leads, and follow-ups on some of them, for development and demos. Safe to run repeatedly.
 
     python manage.py seed_demo_leads
 
@@ -17,6 +17,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from apps.accounts.models import Role
+from apps.activities.models import Activity, ActivityStatus, ActivityType
 from apps.leads.models import Lead, LeadConflict, LeadSource, LeadStatus, SolarPlan
 
 User = get_user_model()
@@ -138,13 +139,34 @@ LEADS = [
 ]
 
 
+A = ActivityType
+# Follow-ups on demo leads, to do and done: lead, heading, type, notes, due in days from the first run, done, and who
+# does it: 'lead' for the lead's assigned staff, 'other' for another staff member (a follow-up's staff is separate).
+FOLLOW_UPS = [
+    ('Arjun Nair', 'Call about the 5 kW quotation', A.PHONE_CALL, 'Call to walk him through the 5 kW quote.', 1, False, 'lead'),
+    ('Priya Menon', 'Send an estimate from her bills', A.FOLLOW_UP, 'Reply on WhatsApp with an estimate from her bills.', 0, False, 'lead'),
+    ('Rahul Kumar', 'Check the roof for shade', A.SITE_VISIT, 'Check the bakery roof for shade from the water tank.', 3, False, 'other'),
+    ('Abdul Kareem', 'Confirm roof size and load', A.PHONE_CALL, 'Confirm the roof size and the sanctioned load.', -2, False, 'lead'),
+    ('Lakshmi Warrier', 'Send the Malayalam brochure', A.NOTE, 'Posted the Malayalam brochure.', -3, True, 'lead'),
+    ('Thomas Chacko', 'Confirm site visit', A.SITE_VISIT, 'Site survey with the installation team.', 4, False, 'other'),
+    ('Reshma Joseph', 'Follow up on 5 kW proposal', A.MEETING, 'Go through the 5 kW proposal with her family.', 1, False, 'lead'),
+    ('Sruthi Menon', 'Send revised quotation', A.FOLLOW_UP, 'Send the revised 10 kW quotation.', -1, False, 'lead'),
+    ('Biju Kurian', 'Discuss financing option', A.PHONE_CALL, 'Explained the subsidy paperwork.', -4, True, 'lead'),
+    ('Vineeth Varma', 'Proposal discussion', A.MEETING, 'Proposal discussion at the office.', -2, True, 'lead'),
+    ('Rajeev Menon', 'Confirm loan approval date', A.FOLLOW_UP, 'Confirm the loan approval date.', 2, False, 'other'),
+    ('Deepa Unnikrishnan', 'Collect the advance payment', A.PHONE_CALL, 'Collect the advance payment.', -6, True, 'lead'),
+    ('Keerthana Raj', 'Confirm installation requirements', A.SITE_VISIT, 'Final roof measurement before installation.', 5, False, 'lead'),
+    ('Nazeema Hussain', 'Check back about a smaller plan', A.NOTE, 'Chose a smaller plan elsewhere; check back in six months.', -10, True, 'lead'),
+]
+
+
 def phone_for(index):
     # Fixed per position, so a re-run finds the leads it already created instead of adding duplicates.
     return f"{'9876'[index % 4]}{(index * 104729023 + 381654729) % 10**9:09d}"
 
 
 class Command(BaseCommand):
-    help = 'Adds 50 fictional demo leads (development only; safe to run repeatedly).'
+    help = 'Adds 50 fictional demo leads and some follow-ups (development only; safe to run repeatedly).'
 
     def handle(self, *args, **options):
         if not settings.DEBUG:
@@ -161,8 +183,9 @@ class Command(BaseCommand):
         team = list(User.objects.filter(is_active=True, role=Role.STAFF).order_by('name', 'id')) or [owner]
         today = timezone.localdate()
         now = timezone.now()
-        created = present = assigned = 0
+        created = present = assigned = follow_ups_added = 0
         not_converted = []
+        demo = {}  # name -> the demo lead
 
         with transaction.atomic():
             plans = {
@@ -210,6 +233,7 @@ class Command(BaseCommand):
                         created_at=created_at, updated_at=created_at + timedelta(days=min(days_ago, 1 + index % 4)),
                     )
                     created += 1
+                demo[name] = lead
                 # Won like any status (from Superhot), then converted to create its Work. Re-running the command
                 # converts the Won leads still waiting once conversion is available.
                 if target == S.WON and lead.status == S.SUPERHOT:
@@ -219,6 +243,31 @@ class Command(BaseCommand):
                         lead.convert(owner)
                     except LeadConflict as refusal:
                         not_converted.append((name, str(refusal.detail)))
+
+            # A demo follow-up already there (same lead, same notes) keeps its status; only details it is missing (a
+            # heading, its staff, a due date: older demo follow-ups had none) are filled in.
+            for name, title, kind, description, due_in, done, doer in FOLLOW_UPS:
+                if name not in demo:
+                    continue
+                lead = demo[name]
+                staff = lead.assigned_to or owner
+                if doer == 'other' and len(team) > 1:
+                    staff = next(person for person in team if person != lead.assigned_to)
+                details = {'title': title, 'assigned_to': staff, 'due_date': today + timedelta(days=due_in)}
+                follow_up, added = Activity.objects.get_or_create(
+                    lead=lead,
+                    description=description,
+                    defaults={
+                        **details,
+                        'type': kind,
+                        'status': ActivityStatus.COMPLETED if done else ActivityStatus.PENDING,
+                        'created_by': lead.assigned_to or owner,
+                    },
+                )
+                follow_ups_added += added
+                missing = {field: value for field, value in details.items() if not getattr(follow_up, field)}
+                if missing:
+                    Activity.objects.filter(pk=follow_up.pk).update(**missing)
 
         seeded = Lead.objects.filter(
             country_code='91', phone__in=[phone_for(i) for i in range(len(LEADS))], name__in=[row[0] for row in LEADS],
@@ -232,6 +281,13 @@ class Command(BaseCommand):
         self.stdout.write('By status: ' + ', '.join(f'{label} {statuses[value]}' for value, label in S.choices))
         self.stdout.write('By plan: ' + ', '.join(f'{name} {plan_counts[name]}' for name, _ in PLANS.values()))
         self.stdout.write('Assigned: ' + ', '.join(f'{name or "Unassigned"} {count}' for name, count in people.items()))
+        follow_ups = Counter(Activity.objects.filter(
+            lead__in=seeded, description__in=[row[3] for row in FOLLOW_UPS],
+        ).values_list('status', flat=True))
+        self.stdout.write(
+            f'Demo follow-ups: {follow_ups_added} added, {sum(follow_ups.values())} in total '
+            f'({follow_ups[ActivityStatus.PENDING]} pending, {follow_ups[ActivityStatus.COMPLETED]} completed).'
+        )
         if not_converted:
             self.stdout.write(self.style.WARNING(
                 f'{len(not_converted)} Won leads are not converted to Work yet: {not_converted[0][1]} '
