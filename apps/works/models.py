@@ -40,6 +40,8 @@ class Work(models.Model):
         related_name='assigned_works',
     )
     due_date = models.DateField(null=True, blank=True)
+    # Shared by the whole team, as on leads: pinned Works are listed first for everyone.
+    is_pinned = models.BooleanField(default=False)
     created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name='created_works')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
