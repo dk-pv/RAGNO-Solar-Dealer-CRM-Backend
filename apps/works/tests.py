@@ -32,7 +32,8 @@ class WorkTestCase(APITestCase):
         cls.plan = SolarPlan.objects.get(capacity=5)
 
     def give_staff_work_access(self):
-        Role.objects.get(pk=Role.STAFF).permissions.add(Permission.objects.get(codename='access_work'))
+        Role.objects.get(pk=Role.STAFF).permissions.add(Permission.objects.get(codename='access_work')
+        )
         return User.objects.get(pk=self.staff.pk)
 
 
