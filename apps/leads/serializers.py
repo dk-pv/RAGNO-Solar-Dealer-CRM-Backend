@@ -55,8 +55,6 @@ class LeadSerializer(serializers.ModelSerializer):
             'id', 'name', 'country_code', 'phone', 'email', 'state', 'district', 'area', 'pin_code',
             'plan', 'plan_name', 'amount', 'status', 'allowed_transitions', 'source',
             'assigned_to', 'assigned_to_name', 'next_follow_up', 'notes', 'is_pinned', 'work',
-            'created_by_name', 'created_at', 'updated_at',
-            'assigned_to', 'assigned_to_name', 'next_follow_up', 'notes', 'is_pinned',
             'can_edit', 'can_delete', 'can_assign', 'can_convert', 'created_by_name', 'created_at', 'updated_at',
             'initial_follow_up',
         ]
@@ -102,8 +100,8 @@ class LeadSerializer(serializers.ModelSerializer):
         return self.context['request'].user.role_id == Role.ADMIN
 
     def get_can_convert(self, lead):
-        # Converting needs both: a Won lead (convert() checks the status) and someone who can change it.
-        return lead.status == LeadStatus.WON and self.get_can_edit(lead)
+        # Converting needs a Won lead without its Work yet (convert() checks both) and someone who can change it.
+        return lead.status == LeadStatus.WON and getattr(lead, 'work', None) is None and self.get_can_edit(lead)
 
     def validate_assigned_to(self, user):
         current = getattr(self.instance, 'assigned_to', None)

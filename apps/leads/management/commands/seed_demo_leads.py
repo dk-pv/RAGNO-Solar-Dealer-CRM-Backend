@@ -183,7 +183,7 @@ class Command(BaseCommand):
         team = list(User.objects.filter(is_active=True, role=Role.STAFF).order_by('name', 'id')) or [owner]
         today = timezone.localdate()
         now = timezone.now()
-        created = present = assigned = follow_ups_added = 0
+        created = present = assigned = follow_ups_added = converted = 0
         not_converted = []
         demo = {}  # name -> the demo lead
 
@@ -234,13 +234,14 @@ class Command(BaseCommand):
                     )
                     created += 1
                 demo[name] = lead
-                # Won like any status (from Superhot), then converted to create its Work. Re-running the command
-                # converts the Won leads still waiting once conversion is available.
+                # Won like any status (from Superhot), then converted to create its Work, once: running the command
+                # again converts only the Won demo leads still without their Work.
                 if target == S.WON and lead.status == S.SUPERHOT:
                     lead.move_to(S.WON)
-                if target == S.WON and lead.status == S.WON:
+                if target == S.WON and lead.status == S.WON and not hasattr(lead, 'work'):
                     try:
                         lead.convert(owner)
+                        converted += 1
                     except LeadConflict as refusal:
                         not_converted.append((name, str(refusal.detail)))
 
@@ -288,8 +289,10 @@ class Command(BaseCommand):
             f'Demo follow-ups: {follow_ups_added} added, {sum(follow_ups.values())} in total '
             f'({follow_ups[ActivityStatus.PENDING]} pending, {follow_ups[ActivityStatus.COMPLETED]} completed).'
         )
+        self.stdout.write(
+            f'Demo Works: {converted} converted now, {seeded.filter(work__isnull=False).count()} Won leads with their Work.'
+        )
         if not_converted:
             self.stdout.write(self.style.WARNING(
-                f'{len(not_converted)} Won leads are not converted to Work yet: {not_converted[0][1]} '
-                'Run this command again once conversion is available and they will be converted.'
+                f'{len(not_converted)} Won leads could not be converted to Work: {not_converted[0][1]}'
             ))
