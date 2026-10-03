@@ -3,6 +3,8 @@
 from django.conf import settings
 from django.db import migrations, models
 
+from ._operations import AddConstraintIfMissing, AddFieldIfMissing, AddIndexIfMissing
+
 
 class Migration(migrations.Migration):
 
@@ -12,30 +14,32 @@ class Migration(migrations.Migration):
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 
+    # Adds only what the database doesn't have yet: a database migrated on the Work activities branch before it was
+    # combined with this one already has some of these (see _operations.py).
     operations = [
-        migrations.AddField(
+        AddFieldIfMissing(
             model_name='activity',
             name='due_date',
             field=models.DateField(blank=True, null=True),
         ),
-        migrations.AddField(
+        AddFieldIfMissing(
             model_name='activity',
             name='status',
             field=models.CharField(choices=[('PENDING', 'Pending'), ('COMPLETED', 'Completed')], default='PENDING', max_length=10),
         ),
-        migrations.AddIndex(
+        AddIndexIfMissing(
             model_name='activity',
             index=models.Index(fields=['status'], name='activities_status_idx'),
         ),
-        migrations.AddIndex(
+        AddIndexIfMissing(
             model_name='activity',
             index=models.Index(fields=['due_date'], name='activities_due_date_idx'),
         ),
-        migrations.AddIndex(
+        AddIndexIfMissing(
             model_name='activity',
             index=models.Index(fields=['created_at'], name='activities_created_at_idx'),
         ),
-        migrations.AddConstraint(
+        AddConstraintIfMissing(
             model_name='activity',
             constraint=models.CheckConstraint(condition=models.Q(('status__in', ['PENDING', 'COMPLETED'])), name='activities_status_valid'),
         ),

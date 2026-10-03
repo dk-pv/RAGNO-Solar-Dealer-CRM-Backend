@@ -4,11 +4,12 @@ from django.contrib.auth.models import Permission
 from django.db import connection
 from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
 
 from apps.accounts.models import Role, User
-from apps.leads.models import Lead, SolarPlan
+from apps.leads.models import Lead, LeadStatus, SolarPlan
 
 from .models import Activity, ActivityStatus
 
@@ -152,7 +153,7 @@ class FollowUpAccessTests(FollowUpTestCase):
         )
         cls.on_a_done = Activity.objects.create(
             lead=cls.a_lead, title='Send brochure', assigned_to=cls.staff_a, due_date=date(2026, 9, 28),
-            status=ActivityStatus.COMPLETED, **follow,
+            status=ActivityStatus.COMPLETED, completed_at=timezone.now(), completed_by=cls.staff_a, **follow,
         )
         cls.on_b = Activity.objects.create(
             lead=cls.b_lead, title='Proposal discussion', assigned_to=cls.staff_b, due_date=date(2026, 10, 2), **follow,
@@ -341,3 +342,70 @@ class InitialFollowUpTests(FollowUpTestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertFalse(Activity.objects.exists())
+
+
+class LeadAndWorkActivitiesTests(FollowUpTestCase):
+    """Lead follow-ups and Work activities share the one activity log, each kind with its own rules and audience."""
+
+    @classmethod
+    def setUpTestData(cls):
+        super().setUpTestData()
+        won = Lead.objects.create(
+            name='Won Lead', phone='9876500009', district='Ernakulam', plan=cls.plan, amount=cls.plan.amount,
+            created_by=cls.admin, status=LeadStatus.WON,
+        )
+        won.convert(cls.admin)
+        cls.work = won.work
+        cls.on_work = Activity.objects.create(
+            work=cls.work, type='SITE_VISIT', description='Roof survey.', assigned_to=cls.staff_a, created_by=cls.admin,
+        )
+        cls.on_lead = Activity.objects.create(
+            lead=cls.a_lead, title='Call Asha', type='PHONE_CALL', assigned_to=cls.staff_a, due_date=date(2026, 10, 5),
+            created_by=cls.admin,
+        )
+
+    def test_completing_a_follow_up_records_when_and_by_whom_and_it_stays_completed(self):
+        self.as_user(self.staff_a)
+        done = self.patch(self.on_lead.pk, status='COMPLETED')
+        self.assertEqual((done.status_code, done.data['completed_by_name']), (200, 'Staff A'))
+        self.assertIsNotNone(done.data['completed_at'])
+        stored = Activity.objects.get(pk=self.on_lead.pk)
+        self.assertEqual((stored.status, stored.completed_by), (ActivityStatus.COMPLETED, self.staff_a))
+        self.assertEqual(self.patch(self.on_lead.pk, status='PENDING').status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_each_list_holds_only_its_own_kind(self):
+        self.as_user(self.admin)
+        self.assertEqual(self.titles(), ['Call Asha'])
+        self.assertEqual(self.page(lead=self.a_lead.pk)['count'], 1)
+        on_work = self.page(work=self.work.pk)['results']
+        self.assertEqual([row['description'] for row in on_work], ['Roof survey.'])
+        row = on_work[0]
+        self.assertEqual(
+            (row['lead'], row['lead_name'], row['work_summary']['customer_name'], row['can_edit'], row['can_delete'],
+             row['can_open_lead']),
+            (None, None, 'Won Lead', True, False, False),
+        )
+
+    def test_staff_without_the_work_module_never_see_a_work_activity_even_one_assigned_to_them(self):
+        self.as_user(self.staff_a)
+        self.assertEqual(self.titles(), ['Call Asha'])
+        url = reverse('activity-detail', args=[self.on_work.pk])
+        self.assertEqual(self.client.get(url).status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(self.patch(self.on_work.pk, status='COMPLETED').status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(self.client.get(reverse('activity-list'), {'work': self.work.pk}).status_code, 403)
+        self.assertEqual(Activity.objects.get(pk=self.on_work.pk).status, ActivityStatus.PENDING)
+
+    def test_a_work_activity_follows_the_work_rules_not_the_follow_up_rules(self):
+        self.as_user(self.admin)
+        # No heading, staff or due date needed; notes are.
+        added = self.client.post(
+            reverse('activity-list'), {'work': self.work.pk, 'type': 'NOTE', 'description': 'Panels delivered.'}, format='json',
+        )
+        self.assertEqual((added.status_code, added.data['status'], added.data['title']), (201, 'PENDING', ''))
+        no_notes = self.client.post(reverse('activity-list'), {'work': self.work.pk, 'type': 'NOTE'}, format='json')
+        self.assertIn('description', no_notes.data)
+        both = self.client.post(
+            reverse('activity-list'), {'work': self.work.pk, 'lead': self.a_lead.pk, 'type': 'NOTE', 'description': 'x'},
+            format='json',
+        )
+        self.assertEqual(both.status_code, status.HTTP_400_BAD_REQUEST)

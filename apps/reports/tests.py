@@ -43,6 +43,7 @@ class ReportTestCase(APITestCase):
 
     def work(self, name, day='2026-09-10', amount=Decimal('185000'), by=None, **fields):
         lead = self.lead(name, day=day, status=LeadStatus.SUPERHOT, amount=amount, assigned_to=fields.pop('assigned_to', None))
+        lead.move_to(LeadStatus.WON)
         lead.convert(by or self.admin)
         Work.objects.filter(pk=lead.work.pk).update(created_at=at(day), **fields)
         return Work.objects.get(pk=lead.work.pk)

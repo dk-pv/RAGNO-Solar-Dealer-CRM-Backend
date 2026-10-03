@@ -262,6 +262,9 @@ class Command(BaseCommand):
                         **details,
                         'type': kind,
                         'status': ActivityStatus.COMPLETED if done else ActivityStatus.PENDING,
+                        # A completed one records when and by whom, as completing it in the CRM does.
+                        'completed_at': now if done else None,
+                        'completed_by': staff if done else None,
                         'created_by': lead.assigned_to or owner,
                     },
                 )

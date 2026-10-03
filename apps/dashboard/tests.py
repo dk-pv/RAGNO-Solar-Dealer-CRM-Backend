@@ -33,6 +33,7 @@ class DashboardTestCase(APITestCase):
 
     def work(self, name, assigned_to=None, **fields):
         lead = self.lead(name, assigned_to=assigned_to, status=LeadStatus.SUPERHOT)
+        lead.move_to(LeadStatus.WON)
         lead.convert(fields.pop('created_by', self.admin))
         Work.objects.filter(pk=lead.work.pk).update(**fields)
         return Work.objects.get(pk=lead.work.pk)

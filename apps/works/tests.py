@@ -281,7 +281,10 @@ class WorkActivityTests(WorkTestCase):
         )
         self.client.force_authenticate(self.admin)
         on_lead = self.client.post(
-            reverse('activity-list'), {'lead': lead.pk, 'type': 'NOTE', 'description': 'Lead note.'}, format='json',
+            reverse('activity-list'),
+            {'lead': lead.pk, 'type': 'NOTE', 'title': 'Lead note', 'assigned_to': self.staff.pk, 'due_date': '2026-10-05',
+             'description': 'Lead note.'},
+            format='json',
         ).data['id']
         self.client.force_authenticate(self.give_staff_work_access())
 
@@ -364,7 +367,13 @@ class WorkActivitiesPageTests(WorkTestCase):
             plan=self.plan, created_by=self.admin, name='Open Lead', phone='9876500009', district='Ernakulam',
             amount=self.plan.amount,
         )
-        self.client.post(reverse('activity-list'), {'lead': lead.pk, 'type': 'NOTE', 'description': 'Lead.'}, format='json')
+        added = self.client.post(
+            reverse('activity-list'),
+            {'lead': lead.pk, 'type': 'NOTE', 'title': 'Lead', 'assigned_to': self.admin.pk, 'due_date': '2026-10-05',
+             'description': 'Lead.'},
+            format='json',
+        )
+        self.assertEqual(added.status_code, status.HTTP_201_CREATED, added.data)
         self.assertNotIn('Lead.', [description for _, description in self.listed()])
 
     def test_the_page_needs_the_work_and_activities_modules(self):

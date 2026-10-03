@@ -4,6 +4,8 @@ import django.db.models.deletion
 from django.conf import settings
 from django.db import migrations, models
 
+from ._operations import AddFieldIfMissing
+
 
 class Migration(migrations.Migration):
 
@@ -12,13 +14,15 @@ class Migration(migrations.Migration):
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 
+    # Adds only what the database doesn't have yet: a database migrated on the Work activities branch before it was
+    # combined with this one already has some of these (see _operations.py).
     operations = [
-        migrations.AddField(
+        AddFieldIfMissing(
             model_name='activity',
             name='assigned_to',
             field=models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.PROTECT, related_name='assigned_activities', to=settings.AUTH_USER_MODEL),
         ),
-        migrations.AddField(
+        AddFieldIfMissing(
             model_name='activity',
             name='title',
             field=models.CharField(blank=True, default='', max_length=150),
