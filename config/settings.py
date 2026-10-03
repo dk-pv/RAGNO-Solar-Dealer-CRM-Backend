@@ -54,6 +54,8 @@ INSTALLED_APPS = [
     'apps.leads',
     'apps.works',
     'apps.activities',
+    'apps.dashboard',
+    'apps.reports',
 ]
 
 MIDDLEWARE = [

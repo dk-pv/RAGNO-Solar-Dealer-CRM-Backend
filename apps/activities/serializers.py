@@ -3,6 +3,7 @@ from rest_framework import serializers
 
 from apps.accounts.models import Role
 from apps.leads.models import Lead
+from apps.works.models import Work
 
 from .models import Activity, ActivityStatus, ActivityType
 
@@ -46,6 +47,8 @@ class ActivitySerializer(FollowUpSerializer):
     lead_phone = serializers.CharField(source='lead.phone', read_only=True)
     assigned_to_name = serializers.SerializerMethodField()
     type_display = serializers.CharField(source='get_type_display', read_only=True)
+    assigned_to_name = serializers.SerializerMethodField()
+    completed_by_name = serializers.SerializerMethodField()
     created_by_name = serializers.SerializerMethodField()
     # What the signed-in user may do with it, so the screens match what the API allows.
     can_edit = serializers.SerializerMethodField()
