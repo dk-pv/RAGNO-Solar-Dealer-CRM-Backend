@@ -166,20 +166,19 @@ class Lead(models.Model):
         self.status, self.updated_at = lead.status, lead.updated_at
 
     def convert(self, user):
-        """Creates the Work for a Won lead. Only Won leads convert, and converting never changes the lead's status:
-        whoever works the lead moves it to Won first."""
+        """Creates the Work for a Won lead. Only Won leads convert, each only once, and converting never changes the
+        lead's status: whoever works the lead moves it to Won first, and it stays Won."""
+        # The Works module copies the customer, plan and lead.amount into the Work. Imported here because the Works
+        # module depends on leads, not the other way round.
+        from apps.works.models import Work
+
         with transaction.atomic():
             # Locked, so two conversions of the same lead run one after the other and can't both create a Work.
             lead = Lead.objects.select_for_update().get(pk=self.pk)
-            if lead.status == LeadStatus.WON:
+            if lead.status != LeadStatus.WON:
+                raise LeadConflict('Only Won leads can be converted.')
+            if Work.objects.filter(lead=lead).exists():
                 raise LeadConflict('This lead has already been converted.')
-            if LeadStatus.WON not in lead.allowed_transitions():
-                raise LeadConflict('Only Superhot leads can be converted.')
-            # The Works module copies the customer, plan and lead.amount into the Work. Imported here because the
-            # Works module depends on leads, not the other way round.
-            from apps.works.models import Work
-
-            work = Work.create_for_lead(lead, user)
-            lead.status = LeadStatus.WON
-            lead.save(update_fields=['status', 'updated_at'])
-        self.status, self.updated_at, self.work = lead.status, lead.updated_at, work
+            self.work = Work.create_for_lead(lead, user)
+        # As the locked row has it (Won), should this copy have been read before a concurrent move to Won committed.
+        self.status, self.updated_at = lead.status, lead.updated_at

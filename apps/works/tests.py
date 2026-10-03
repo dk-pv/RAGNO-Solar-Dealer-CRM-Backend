@@ -15,9 +15,10 @@ PASSWORD = 'Solar-Panel-2026'
 
 
 def convert_lead(plan, user, **fields):
-    """A Superhot lead converted by `user`: the only way a Work is created."""
+    """A Superhot lead moved to Won and converted by `user`: the only way a Work is created."""
     values = {'name': 'Asha Menon', 'phone': '9876543210', 'district': 'Ernakulam', 'amount': plan.amount, **fields}
     lead = Lead.objects.create(plan=plan, created_by=user, status=LeadStatus.SUPERHOT, **values)
+    lead.move_to(LeadStatus.WON)
     lead.convert(user)
     return lead.work
 
@@ -27,7 +28,8 @@ class WorkTestCase(APITestCase):
     def setUpTestData(cls):
         cls.admin = User.objects.create_user(email='admin@example.com', password=PASSWORD, name='Admin', role=Role.ADMIN)
         cls.staff = User.objects.create_user(email='staff@example.com', password=PASSWORD, name='Priya Nair')
-        cls.plan = SolarPlan.objects.create(name='5 kW', capacity=5, amount=200000)
+        # The 5 kW plan (200000) every database starts with (leads migration 0002).
+        cls.plan = SolarPlan.objects.get(capacity=5)
 
     def give_staff_work_access(self):
         Role.objects.get(pk=Role.STAFF).permissions.add(Permission.objects.get(codename='access_work'))
@@ -116,6 +118,7 @@ class WorkApiTests(WorkTestCase):
         )
         self.client.force_authenticate(self.admin)
 
+        self.client.post(reverse('lead-change-status', args=[lead.pk]), {'status': LeadStatus.WON}, format='json')
         converted = self.client.post(reverse('lead-convert', args=[lead.pk]))
         listed = self.client.get(reverse('lead-list')).data['results']
 

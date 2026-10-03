@@ -31,6 +31,14 @@ DEBUG = os.environ.get('DJANGO_DEBUG', 'False').lower() in ('1', 'true')
 
 ALLOWED_HOSTS = env_list('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1')
 
+# Production (DJANGO_DEBUG off) runs behind an HTTPS proxy, such as Render's, that passes requests on over HTTP:
+# its X-Forwarded-Proto header tells Django the visitor's connection was HTTPS. The CRM signs requests with JWTs, not
+# cookies; the cookies the Django admin uses are sent over HTTPS only.
+if not DEBUG:
+    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+
 
 # Application definition
 INSTALLED_APPS = [

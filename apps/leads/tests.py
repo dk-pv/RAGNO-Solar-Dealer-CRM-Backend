@@ -17,6 +17,7 @@ from rest_framework.test import APITestCase
 
 from apps.accounts.models import Role, User
 from apps.activities.models import Activity
+from apps.works.models import Work, WorkStage
 
 from .management.commands.seed_demo_leads import phone_for
 from .models import Lead, LeadConflict, LeadStatus, SolarPlan
@@ -73,12 +74,25 @@ class LeadModelTests(TestCase):
             with self.assertRaisesMessage(LeadConflict, 'Only Won leads can be converted.'):
                 lead.convert(self.admin)
             self.assertEqual(Lead.objects.get(pk=lead.pk).status, current)
+        # Moving a lead to Lost never creates a Work either.
+        lost = make_lead(self.plan, self.admin, status=S.SUPERHOT, phone='9876500009')
+        lost.move_to(S.LOST)
+        self.assertFalse(Work.objects.exists())
 
-        won = make_lead(self.plan, self.admin, status=S.SUPERHOT, phone='9876500010')
+        won = make_lead(self.plan, self.admin, status=S.SUPERHOT, phone='9876500010', amount=Decimal('185000'))
         won.move_to(S.WON)
-        # Eligible, so refused only at the Work step until the Works module exists; the lead stays Won.
-        with self.assertRaisesMessage(LeadConflict, "the Works module isn't available yet"):
-            won.convert(self.admin)
+        self.assertFalse(Work.objects.exists())  # reaching Won doesn't convert by itself
+        won.convert(self.admin)
+        work = Work.objects.get(lead=won)
+        self.assertEqual(
+            (work.customer_name, work.plan, work.amount, work.created_by, work.stage),
+            (won.name, self.plan, Decimal('185000'), self.admin, WorkStage.LOAN_DOCUMENTS),
+        )
+        self.assertEqual(Lead.objects.get(pk=won.pk).status, S.WON)
+        # Once only: converting again is refused, creates nothing and leaves the lead Won.
+        with self.assertRaisesMessage(LeadConflict, 'This lead has already been converted.'):
+            Lead.objects.get(pk=won.pk).convert(self.admin)
+        self.assertEqual(Work.objects.count(), 1)
         self.assertEqual(Lead.objects.get(pk=won.pk).status, S.WON)
 
     def test_every_database_has_the_four_plans_at_their_starting_prices(self):
@@ -323,13 +337,27 @@ class LeadApiTests(APITestCase):
             self.assertIn('Only Won leads can be converted.', response.data['detail'])
             self.assertEqual(Lead.objects.get(pk=lead.pk).status, current)
 
+        self.assertFalse(Work.objects.exists())
+
         won = make_lead(self.plan, self.admin, status=S.WON, phone='9876500010')
         self.assertTrue(self.client.get(reverse('lead-detail', args=[won.pk])).data['can_convert'])
         response = self.client.post(reverse('lead-convert', args=[won.pk]))
-        # Eligible, so refused only at the Work step until the Works module exists; the lead stays Won.
-        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
-        self.assertIn("the Works module isn't available yet", response.data['detail'])
+        work = Work.objects.get(lead=won)
+        self.assertEqual(
+            (response.status_code, response.data['status'], response.data['work'], response.data['can_convert']),
+            (status.HTTP_200_OK, 'WON', work.pk, False),
+        )
+        self.assertEqual(work.stage, WorkStage.LOAN_DOCUMENTS)  # the Work starts at the Work Pipeline's first stage
+        again = self.client.post(reverse('lead-convert', args=[won.pk]))
+        self.assertEqual(again.status_code, status.HTTP_409_CONFLICT)
+        self.assertIn('This lead has already been converted.', again.data['detail'])
+        self.assertEqual(Work.objects.count(), 1)
         self.assertEqual(Lead.objects.get(pk=won.pk).status, S.WON)
+        # A Won lead can't be moved on to Lost, and a converted lead keeps its Work: deleting it is refused.
+        lost = self.client.post(reverse('lead-change-status', args=[won.pk]), {'status': 'LOST'}, format='json')
+        self.assertEqual(lost.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(self.client.delete(reverse('lead-detail', args=[won.pk])).status_code, status.HTTP_409_CONFLICT)
+        self.assertTrue(Work.objects.filter(lead=won).exists())
 
     def test_export_is_an_admin_only_csv_that_follows_the_filters_and_neutralizes_formulas(self):
         make_lead(self.plan, self.admin, name='=HYPERLINK("http://example.com")', status=S.HOT)
@@ -407,8 +435,10 @@ class LeadAccessTests(APITestCase):
             ('delete', self.client.delete(detail)),
         ]
 
-    def walk_to_won_then_convert(self, lead):
-        """New -> Initial Contact -> Hot -> Superhot -> Won through the status API, with conversion refused before Won."""
+    def walk_to_won_then_convert(self, lead, user):
+        """New -> Initial Contact -> Hot -> Superhot -> Won through the status API, with conversion refused before Won,
+        then converted by `user`: one Work, and the lead stays Won."""
+        self.as_user(user)
         detail = reverse('lead-detail', args=[lead.pk])
         convert_url = reverse('lead-convert', args=[lead.pk])
         for target in (S.INITIAL_CONTACT, S.HOT, S.SUPERHOT, S.WON):
@@ -420,19 +450,29 @@ class LeadAccessTests(APITestCase):
             moved = self.client.post(reverse('lead-change-status', args=[lead.pk]), {'status': target}, format='json')
             self.assertEqual((moved.status_code, moved.data['status']), (200, target))
             self.assertEqual(Lead.objects.get(pk=lead.pk).status, target)
+        self.assertFalse(Work.objects.filter(lead=lead).exists())
         self.assertTrue(self.client.get(detail).data['can_convert'])
         converted = self.client.post(convert_url)
-        self.assertEqual(converted.status_code, status.HTTP_409_CONFLICT)
-        self.assertIn("the Works module isn't available yet", converted.data['detail'])
+        work = Work.objects.get(lead=lead)
+        self.assertEqual((converted.status_code, converted.data['status'], converted.data['work']), (200, S.WON, work.pk))
+        # The Work takes the customer, plan, amount and assignee as they are at conversion.
+        self.assertEqual(
+            (work.customer_name, work.phone, work.plan, work.amount, work.assigned_to, work.created_by),
+            (lead.name, lead.phone, lead.plan, lead.amount, lead.assigned_to, user),
+        )
+        self.assertFalse(self.client.get(detail).data['can_convert'])
+        again = self.client.post(convert_url)
+        self.assertEqual(again.status_code, status.HTTP_409_CONFLICT)
+        self.assertIn('This lead has already been converted.', again.data['detail'])
+        self.assertEqual(Work.objects.filter(lead=lead).count(), 1)
         self.assertEqual(Lead.objects.get(pk=lead.pk).status, S.WON)
 
     def test_admin_moves_a_lead_assigned_to_someone_else_to_won_and_converts_it(self):
-        self.as_user(self.admin)
-        self.walk_to_won_then_convert(self.b_lead)
+        self.walk_to_won_then_convert(self.b_lead, self.admin)
 
     def test_assigned_staff_move_their_lead_to_won_and_convert_it(self):
-        self.as_user(self.staff_a)
-        self.walk_to_won_then_convert(make_lead(self.plan, self.admin, phone='9876500004', assigned_to=self.staff_a))
+        lead = make_lead(self.plan, self.admin, phone='9876500004', assigned_to=self.staff_a)
+        self.walk_to_won_then_convert(lead, self.staff_a)
 
     def test_the_status_api_checks_the_user_the_lead_and_the_status(self):
         url = reverse('lead-change-status', args=[self.b_lead.pk])
@@ -499,6 +539,7 @@ class LeadAccessTests(APITestCase):
         # Not even another person's Won lead.
         won = make_lead(self.plan, self.admin, phone='9876500005', assigned_to=self.staff_b, status=S.WON)
         self.assertEqual(self.client.post(reverse('lead-convert', args=[won.pk])).status_code, 404)
+        self.assertFalse(Work.objects.filter(lead=won).exists())
 
     def test_staff_cannot_assign_or_reassign_leads(self):
         self.as_user(self.staff_a)
@@ -568,8 +609,12 @@ class SeedDemoLeadsTests(TestCase):
             Counter(Lead.objects.values_list('status', flat=True)),
             {S.NEW: 10, S.INITIAL_CONTACT: 9, S.HOT: 9, S.SUPERHOT: 8, S.WON: 7, S.LOST: 7},
         )
-        # Converting creates their Work, which waits for the Works module.
-        self.assertIn('7 Won leads are not converted to Work yet', second)
+        # Each Won demo lead is converted once: its Work is created on the first run and never again.
+        self.assertIn('Demo Works: 7 converted now, 7 Won leads with their Work.', first)
+        self.assertIn('Demo Works: 0 converted now, 7 Won leads with their Work.', second)
+        self.assertNotIn('could not be converted', first + second)
+        self.assertEqual(Work.objects.count(), 7)
+        self.assertEqual(set(Work.objects.values_list('lead__status', flat=True)), {S.WON})
         # Follow-ups on demo leads, to do and done, added once.
         self.assertIn('Demo follow-ups: 14 added, 14 in total (9 pending, 5 completed).', first)
         self.assertIn('Demo follow-ups: 0 added, 14 in total (9 pending, 5 completed).', second)
