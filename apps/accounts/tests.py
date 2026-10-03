@@ -1,6 +1,7 @@
 from django.contrib.auth import authenticate
 from django.contrib.auth.hashers import identify_hasher
 from django.contrib.auth.models import Permission
+from django.core.cache import cache
 from django.db import IntegrityError, transaction
 from django.test import TestCase
 from django.urls import reverse
@@ -95,8 +96,19 @@ class AuthApiTests(APITestCase):
     def setUpTestData(cls):
         cls.user = User.objects.create_user(email='asha@example.com', password=PASSWORD, name='Asha')
 
+    def setUp(self):
+        # Sign-in attempts are rate-limited per address and counted in the cache, which outlives a test.
+        cache.clear()
+
     def login(self, email, password=PASSWORD):
         return self.client.post(reverse('auth-login'), {'email': email, 'password': password}, format='json')
+
+    def test_login_is_rate_limited_per_address(self):
+        for _ in range(10):
+            self.assertEqual(self.login('asha@example.com', 'wrong-password').status_code, status.HTTP_401_UNAUTHORIZED)
+
+        # The eleventh attempt in the minute is refused even with the right password.
+        self.assertEqual(self.login('asha@example.com').status_code, status.HTTP_429_TOO_MANY_REQUESTS)
 
     def test_login_with_email_returns_access_and_refresh_tokens(self):
         response = self.login('ASHA@example.com')

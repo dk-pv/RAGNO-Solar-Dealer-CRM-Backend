@@ -4,10 +4,19 @@ from rest_framework.decorators import action
 from rest_framework.generics import RetrieveAPIView
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.throttling import ScopedRateThrottle
+from rest_framework_simplejwt.views import TokenObtainPairView
 
 from .models import Department, Role, User
 from .permissions import MODULES, IsAdminRole, ModelPermissions
 from .serializers import DepartmentSerializer, RoleSerializer, UserSerializer
+
+
+class LoginView(TokenObtainPairView):
+    """Sign-in, limited to a few attempts a minute per address (the 'login' rate in settings) against password guessing."""
+
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'login'
 
 
 class MeView(RetrieveAPIView):

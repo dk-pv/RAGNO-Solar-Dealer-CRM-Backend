@@ -91,7 +91,6 @@ WSGI_APPLICATION = 'config.wsgi.application'
 
 # Database
 
-# Database
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.postgresql',
@@ -151,6 +150,9 @@ REST_FRAMEWORK = {
     ],
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
     'PAGE_SIZE': 25,
+    # Sign-in attempts per address (apps.accounts.views.LoginView), so a password can't be guessed by brute force.
+    # Every other endpoint needs a valid token. Counted per process: a multi-worker server allows a few times this.
+    'DEFAULT_THROTTLE_RATES': {'login': '10/min'},
 }
 
 SIMPLE_JWT = {
@@ -161,6 +163,26 @@ SIMPLE_JWT = {
 }
 
 CORS_ALLOWED_ORIGINS = env_list('CORS_ALLOWED_ORIGINS', 'http://localhost:3000')
+
+
+# Logging
+
+# Errors go to the server's output (which gunicorn and the host capture). Django's defaults send them only by email to
+# ADMINS, which isn't configured, so a production 500 would otherwise leave no trace. Request bodies and secrets are
+# never logged: only the exception and the request path.
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {'console': {'format': '%(asctime)s %(levelname)s %(name)s %(message)s'}},
+    'handlers': {'console': {'class': 'logging.StreamHandler', 'formatter': 'console'}},
+    'root': {'handlers': ['console'], 'level': 'WARNING'},
+    'loggers': {
+        # 5xx responses with their traceback; 4xx are normal and stay quiet.
+        'django.request': {'handlers': ['console'], 'level': 'ERROR', 'propagate': False},
+        # Refused hosts and the like: a misconfigured ALLOWED_HOSTS shows up here.
+        'django.security': {'handlers': ['console'], 'level': 'ERROR', 'propagate': False},
+    },
+}
 
 
 # Internationalization
