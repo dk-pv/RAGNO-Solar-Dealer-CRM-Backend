@@ -7,12 +7,27 @@ from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import SAFE_METHODS, BasePermission
 
+from apps.accounts.models import Role
 from apps.leads.models import Lead
+from apps.notifications import services as notifications
 
 from .models import Activity, ActivityStatus
 from .serializers import ActivityQuerySerializer, ActivitySerializer, WorkActivityQuerySerializer
 
+NOT_YOUR_ACTIVITY = 'You can only update activities assigned to you.'
+NOT_YOUR_ASSIGNMENT = 'Only an admin can reassign an activity assigned to someone else.'
+
 PENDING_FIRST = Case(When(status=ActivityStatus.PENDING, then=Value(0)), default=Value(1), output_field=IntegerField())
+
+
+def mine_first(user):
+    """On the Activities pages, a staff member's own work comes first: the activities assigned to them, then those
+    assigned to others, then unassigned ones, each group in the page's chosen order. An admin's pages keep that order
+    alone: the pages are their overview of everyone's work."""
+    if user.role_id == Role.ADMIN:
+        return []
+    return [Case(When(assigned_to=user, then=Value(0)), When(assigned_to__isnull=False, then=Value(1)), default=Value(2),
+                 output_field=IntegerField())]
 # One Work's activities: pending first, the soonest due first; then completed, the latest first.
 WITHIN_WORK = [PENDING_FIRST, F('completed_at').desc(nulls_last=True), F('due_date').asc(nulls_last=True), '-created_at', '-id']
 # The Work Activities page. Every order but due date keeps each Work's activities together, in the order above.
@@ -55,8 +70,10 @@ def filter_follow_ups(follow_ups, query_params, user):
     ordering = params.get('ordering', '-created_at')
     field = F('pending_rank' if ordering.lstrip('-') == 'status' else ordering.lstrip('-'))
     order = field.desc(nulls_last=True) if ordering.startswith('-') else field.asc(nulls_last=True)
-    # Sorting by status puts Pending first; the newest first among equals; the id keeps pages stable.
-    return follow_ups.annotate(pending_rank=PENDING_FIRST).order_by(order, '-created_at', '-id')
+    # Sorting by status puts Pending first; the newest first among equals; the id keeps pages stable. The Lead Activities
+    # page (no one lead) lists a staff member's own follow-ups first; one lead's follow-ups keep the order asked for.
+    first = mine_first(user) if 'lead' not in params else []
+    return follow_ups.annotate(pending_rank=PENDING_FIRST).order_by(*first, order, '-created_at', '-id')
 
 
 def required_permission(on_work, method):
@@ -164,11 +181,33 @@ class ActivityViewSet(
         if 'due_before' in params:
             activities = activities.filter(due_date__lte=params['due_before'])
 
-        page = self.paginate_queryset(activities.order_by(*WORK_ACTIVITY_ORDERS[params.get('ordering', '-work')]))
+        order = [*mine_first(request.user), *WORK_ACTIVITY_ORDERS[params.get('ordering', '-work')]]
+        page = self.paginate_queryset(activities.order_by(*order))
         return self.get_paginated_response(self.get_serializer(page, many=True).data)
 
     def perform_create(self, serializer):
-        serializer.save(created_by=self.request.user)
+        activity = serializer.save(created_by=self.request.user)
+        notifications.activity_assigned(activity, self.request.user)
+
+    def perform_update(self, serializer):
+        """Completing or reopening is for the assignee or an admin (Activity.status_changeable_by): anyone else who can
+        edit the activity is refused with 403 before anything is saved. The same goes for taking over an activity that is
+        assigned to someone else, so the rule can't be sidestepped by reassigning it first; an unassigned one may be taken.
+        Whoever it is newly assigned to is told, as are the admins and the assignee when its status changes."""
+        activity, user = serializer.instance, self.request.user
+        changes = serializer.validated_data
+        status_changes = 'status' in changes and changes['status'] != activity.status
+        if status_changes and not activity.status_changeable_by(user):
+            raise PermissionDenied(NOT_YOUR_ACTIVITY)
+        reassigns = 'assigned_to' in changes and changes['assigned_to'] != activity.assigned_to
+        if reassigns and not activity.status_changeable_by(user):
+            raise PermissionDenied(NOT_YOUR_ASSIGNMENT)
+        assignee_before = activity.assigned_to_id
+        activity = serializer.save()
+        if activity.assigned_to_id != assignee_before:
+            notifications.activity_assigned(activity, user)
+        if status_changes:
+            notifications.activity_status_changed(activity, user)
 
     def perform_destroy(self, activity):
         if activity.work_id:

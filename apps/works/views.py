@@ -10,10 +10,13 @@ from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import BasePermission
 from rest_framework.response import Response
 
+from apps.accounts.permissions import IsAdminRole
 from apps.activities.models import ActivityStatus
+from apps.leads.views import bulk_apply
+from apps.notifications import services as notifications
 
 from .models import Work, WorkStage
-from .serializers import WorkQuerySerializer, WorkSerializer
+from .serializers import BulkIdsSerializer, BulkStageSerializer, WorkQuerySerializer, WorkSerializer
 
 User = get_user_model()
 
@@ -82,9 +85,10 @@ def filter_works(works, query_params):
 
 
 class WorkViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.UpdateModelMixin, viewsets.GenericViewSet):
-    # No create or delete: converting a lead creates its Work, and a Work keeps the job's history.
+    # No create, and no single delete: converting a lead creates its Work, and a Work keeps the job's history. An admin
+    # can remove Works in bulk from the list (bulk_delete); POST is for that and the other bulk actions only.
     # No PUT: only the stage, assignee, due date and pin change.
-    http_method_names = ['get', 'patch', 'head', 'options']
+    http_method_names = ['get', 'post', 'patch', 'head', 'options']
     serializer_class = WorkSerializer
     permission_classes = [CanUseWorks]
     pagination_class = WorkPagination
@@ -96,6 +100,46 @@ class WorkViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.Updat
             works = filter_works(works, self.request.query_params)
         # Not for the summary: joining the activities would count each Work's amount once per activity.
         return works if self.action == 'summary' else works.annotate(**ACTIVITY_STATS)
+
+    def get_permissions(self):
+        # Deleting Works (with their activity history) is an admin's decision; the Work module covers the rest.
+        return [IsAdminRole()] if self.action == 'bulk_delete' else [CanUseWorks()]
+
+    def set_stage(self, work, stage):
+        """Moves the Work and, when it reaches Completed, tells the admins. Called for a PATCH and for the bulk action."""
+        was_completed = work.stage == WorkStage.COMPLETED
+        if work.stage != stage:
+            work.stage = stage
+            work.save(update_fields=['stage', 'updated_at'])
+        if stage == WorkStage.COMPLETED and not was_completed:
+            notifications.work_completed(work, self.request.user)
+
+    def perform_update(self, serializer):
+        before = serializer.instance.stage
+        work = serializer.save()
+        if work.stage == WorkStage.COMPLETED and before != WorkStage.COMPLETED:
+            notifications.work_completed(work, self.request.user)
+
+    @action(detail=False, methods=['post'], url_path='bulk-stage')
+    def bulk_stage(self, request):
+        """Moves the selected Works to one stage, as the row's stage control does for one."""
+        body = BulkStageSerializer(data=request.data)
+        body.is_valid(raise_exception=True)
+        stage = body.validated_data['stage']
+        return bulk_apply(
+            Work.objects.all(), body.validated_data['ids'], lambda work: self.set_stage(work, stage),
+            label=lambda work: work.customer_name,
+        )
+
+    @action(detail=False, methods=['post'], url_path='bulk-delete')
+    def bulk_delete(self, request):
+        """Admins only. Removes the selected Works and their activities; each lead stays Won and can be converted again."""
+        body = BulkIdsSerializer(data=request.data)
+        body.is_valid(raise_exception=True)
+        return bulk_apply(
+            Work.objects.all(), body.validated_data['ids'], lambda work: work.delete(),
+            label=lambda work: work.customer_name,
+        )
 
     @action(detail=False)
     def summary(self, request):

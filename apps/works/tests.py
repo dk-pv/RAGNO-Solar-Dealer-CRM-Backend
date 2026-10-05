@@ -9,7 +9,9 @@ from rest_framework import status
 from rest_framework.test import APITestCase
 
 from apps.accounts.models import Role, User
+from apps.activities.models import Activity
 from apps.leads.models import Lead, LeadConflict, LeadStatus, SolarPlan
+from apps.notifications.models import Notification
 
 from .models import Work, WorkStage
 
@@ -172,7 +174,7 @@ class WorkApiTests(WorkTestCase):
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
         self.assertEqual(Work.objects.get(pk=work.pk).stage, WorkStage.LOAN_DOCUMENTS)
 
-    def test_works_are_assigned_to_active_users_only_and_are_never_created_or_deleted_through_the_api(self):
+    def test_works_are_assigned_to_active_users_only_and_have_no_create_or_single_delete_through_the_api(self):
         work = convert_lead(self.plan, self.admin)
         inactive = User.objects.create_user(email='left@example.com', password=PASSWORD, name='Left', is_active=False)
         self.client.force_authenticate(self.admin)
@@ -402,3 +404,61 @@ class WorkActivitiesPageTests(WorkTestCase):
                 reverse('activity-list'), {'work': third.pk, 'type': 'NOTE', 'description': 'More.'}, format='json',
             )
         self.assertEqual(queries(), before)
+
+
+class BulkWorkActionTests(WorkTestCase):
+    """The Works list's bulk actions: moving the selected Works to a stage (the Work module), and an admin removing them."""
+
+    def setUp(self):
+        self.first = convert_lead(self.plan, self.admin, name='Anu Joseph', phone='9876500001')
+        self.second = convert_lead(self.plan, self.admin, name='Biju Paul', phone='9876500002')
+        Activity.objects.create(work=self.first, type='NOTE', description='Panels delivered.', created_by=self.admin)
+
+    def bulk(self, name, **body):
+        return self.client.post(reverse(f'work-bulk-{name}'), body, format='json')
+
+    def test_bulk_stage_moves_the_selected_works_and_tells_the_admins_about_each_completion_once(self):
+        self.client.force_authenticate(self.give_staff_work_access())
+        response = self.bulk('stage', ids=[self.first.pk, self.second.pk, 999999], stage=WorkStage.COMPLETED)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data['succeeded'], [self.first.pk, self.second.pk])
+        self.assertEqual(response.data['failed'], [{'id': 999999, 'name': None, 'reason': "This record no longer exists, or you don't have access to it."}])
+        self.assertEqual(set(Work.objects.values_list('stage', flat=True)), {WorkStage.COMPLETED})
+        completed = Notification.objects.filter(recipient=self.admin, kind='WORK_COMPLETED')
+        self.assertEqual(sorted(completed.values_list('work_id', flat=True)), sorted([self.first.pk, self.second.pk]))
+        self.assertIn('Installation work for Anu Joseph', completed.get(work=self.first).message)
+        # Already Completed: moving them there again changes nothing and tells no one again.
+        self.assertEqual(self.bulk('stage', ids=[self.first.pk, self.second.pk], stage=WorkStage.COMPLETED).data['succeeded'], [self.first.pk, self.second.pk])
+        self.assertEqual(Notification.objects.filter(kind='WORK_COMPLETED').count(), 2)
+        # Back to an earlier stage, as a single Work can be moved.
+        self.assertEqual(self.bulk('stage', ids=[self.first.pk], stage=WorkStage.STRUCTURE).data['succeeded'], [self.first.pk])
+        self.assertEqual(Work.objects.get(pk=self.first.pk).stage, WorkStage.STRUCTURE)
+        for bad in ({'ids': [self.first.pk], 'stage': 'INSTALLED'}, {'ids': [], 'stage': WorkStage.COMPLETED}, {'stage': WorkStage.COMPLETED}):
+            self.assertEqual(self.bulk('stage', **bad).status_code, status.HTTP_400_BAD_REQUEST, bad)
+
+    def test_bulk_stage_needs_the_work_module(self):
+        self.client.force_authenticate(self.staff)
+        self.assertEqual(self.bulk('stage', ids=[self.first.pk], stage=WorkStage.COMPLETED).status_code, status.HTTP_403_FORBIDDEN)
+        self.client.force_authenticate(None)
+        self.assertEqual(self.bulk('stage', ids=[self.first.pk], stage=WorkStage.COMPLETED).status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertEqual(Work.objects.get(pk=self.first.pk).stage, WorkStage.LOAN_DOCUMENTS)
+
+    def test_bulk_delete_is_for_admins_only_and_removes_the_works_with_their_activities(self):
+        self.client.force_authenticate(self.give_staff_work_access())
+        self.assertEqual(self.bulk('delete', ids=[self.first.pk]).status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(Work.objects.count(), 2)
+
+        self.client.force_authenticate(self.admin)
+        response = self.bulk('delete', ids=[self.first.pk, 999999])
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data['succeeded'], [self.first.pk])
+        self.assertEqual(response.data['failed'][0]['id'], 999999)
+        self.assertEqual(list(Work.objects.values_list('pk', flat=True)), [self.second.pk])
+        self.assertFalse(Activity.objects.filter(work_id=self.first.pk).exists())
+        # The lead stays Won, and without its Work it can be converted again.
+        lead = self.client.get(reverse('lead-detail', args=[self.first.lead_id])).data
+        self.assertEqual((lead['status'], lead['work'], lead['can_convert']), (LeadStatus.WON, None, True))
+        # Single-record deletion is still not offered.
+        self.assertEqual(self.client.delete(reverse('work-detail', args=[self.second.pk])).status_code, 405)

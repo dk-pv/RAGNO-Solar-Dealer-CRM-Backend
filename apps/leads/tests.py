@@ -17,6 +17,7 @@ from rest_framework.test import APITestCase
 
 from apps.accounts.models import Role, User
 from apps.activities.models import Activity
+from apps.notifications.models import Notification
 from apps.works.models import Work, WorkStage
 
 from .management.commands.seed_demo_leads import phone_for
@@ -659,3 +660,113 @@ class SeedDemoLeadsTests(TestCase):
         with self.assertRaisesMessage(CommandError, 'createsuperuser'):
             self.seed()
         self.assertFalse(Lead.objects.exists())
+
+
+class BulkLeadActionTests(APITestCase):
+    """The list's bulk actions: each selected lead goes through the same rules as its single-record action, and the
+    response says which went through and, for each that didn't, why."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.admin = User.objects.create_user(email='admin@example.com', password=PASSWORD, name='Admin', role=Role.ADMIN)
+        cls.admin_2 = User.objects.create_user(email='admin2@example.com', password=PASSWORD, name='Admin Two', role=Role.ADMIN)
+        cls.staff_a = User.objects.create_user(email='a@example.com', password=PASSWORD, name='Staff A')
+        cls.staff_b = User.objects.create_user(email='b@example.com', password=PASSWORD, name='Staff B')
+        grant(cls.staff_a, 'view_lead', 'add_lead', 'change_lead')
+        cls.plan = SolarPlan.objects.get(capacity=5)
+
+    def setUp(self):
+        self.new = make_lead(self.plan, self.admin, name='New Lead', phone='9876500001', assigned_to=self.staff_a)
+        self.hot = make_lead(self.plan, self.admin, name='Hot Lead', phone='9876500002', status=S.HOT, assigned_to=self.staff_a)
+        self.won = make_lead(self.plan, self.admin, name='Won Lead', phone='9876500003', status=S.WON, assigned_to=self.staff_a)
+        self.lost = make_lead(self.plan, self.admin, name='Lost Lead', phone='9876500004', status=S.LOST, assigned_to=self.staff_a)
+        self.converted = make_lead(self.plan, self.admin, name='Converted Lead', phone='9876500005', status=S.WON, assigned_to=self.staff_a)
+        self.converted.convert(self.admin)
+        Activity.objects.create(lead=self.new, title='Call', type='PHONE_CALL', assigned_to=self.staff_a, created_by=self.admin)
+        self.b_lead = make_lead(self.plan, self.admin, name='B Lead', phone='9876500006', assigned_to=self.staff_b)
+
+    def as_user(self, user):
+        self.client.force_authenticate(User.objects.get(pk=user.pk))
+
+    def bulk(self, name, **body):
+        return self.client.post(reverse(f'lead-bulk-{name}'), body, format='json')
+
+    def failures(self, response):
+        return {row['id']: row['reason'] for row in response.data['failed']}
+
+    def test_bulk_status_moves_each_lead_by_the_pipeline_rules_and_reports_the_rest(self):
+        self.as_user(self.admin)
+        response = self.bulk('status', ids=[self.new.pk, self.hot.pk, self.won.pk, self.lost.pk, 999999, self.new.pk], status='SUPERHOT')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data['succeeded'], [self.new.pk, self.hot.pk])
+        self.assertEqual(self.failures(response), {
+            self.won.pk: "A Won lead can't move to Superhot.",
+            self.lost.pk: "A Lost lead can't move to Superhot.",
+            999999: "This record no longer exists, or you don't have access to it.",
+        })
+        self.assertEqual([row['name'] for row in response.data['failed']], ['Won Lead', 'Lost Lead', None])
+        self.assertEqual(Lead.objects.get(pk=self.new.pk).status, S.SUPERHOT)
+        self.assertEqual(Lead.objects.get(pk=self.hot.pk).status, S.SUPERHOT)
+        self.assertEqual(Lead.objects.get(pk=self.won.pk).status, S.WON)
+        # Won through the bulk action creates no Work: conversion stays a separate, explicit step.
+        self.assertEqual(self.bulk('status', ids=[self.new.pk], status='WON').data['succeeded'], [self.new.pk])
+        self.assertFalse(Work.objects.filter(lead=self.new).exists())
+
+        for bad in ({'ids': [self.new.pk], 'status': 'CONFIRMED'}, {'ids': [], 'status': 'HOT'}, {'status': 'HOT'},
+                    {'ids': ['x'], 'status': 'HOT'}, {'ids': list(range(1, 102)), 'status': 'HOT'}, {'ids': [0], 'status': 'HOT'}):
+            self.assertEqual(self.bulk('status', **bad).status_code, status.HTTP_400_BAD_REQUEST, bad)
+
+    def test_bulk_convert_converts_only_won_leads_once_through_the_same_rules_and_tells_the_admins(self):
+        self.as_user(self.staff_a)
+        response = self.bulk('convert', ids=[self.won.pk, self.hot.pk, self.converted.pk, self.lost.pk, self.b_lead.pk])
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data['succeeded'], [self.won.pk])
+        self.assertEqual(self.failures(response), {
+            self.hot.pk: 'Only Won leads can be converted.',
+            self.converted.pk: 'This lead has already been converted.',
+            self.lost.pk: 'Only Won leads can be converted.',
+            # Another person's lead is out of reach for staff, as it is for the single action.
+            self.b_lead.pk: "This record no longer exists, or you don't have access to it.",
+        })
+        work = Work.objects.get(lead=self.won)
+        self.assertEqual((work.customer_name, work.amount, work.created_by), ('Won Lead', self.plan.amount, self.staff_a))
+        self.assertEqual(Lead.objects.get(pk=self.won.pk).status, S.WON)
+        self.assertEqual(Work.objects.count(), 2)
+        for admin in (self.admin, self.admin_2):
+            [notice] = Notification.objects.filter(recipient=admin)
+            self.assertEqual((notice.kind, notice.lead_id, notice.work_id), ('LEAD_CONVERTED', self.won.pk, work.pk))
+        # Again: already converted, and still one Work.
+        again = self.bulk('convert', ids=[self.won.pk])
+        self.assertEqual((again.data['succeeded'], self.failures(again)), ([], {self.won.pk: 'This lead has already been converted.'}))
+        self.assertEqual(Work.objects.filter(lead=self.won).count(), 1)
+
+    def test_bulk_delete_is_for_admins_and_keeps_leads_that_have_a_work(self):
+        self.as_user(self.staff_a)
+        self.assertEqual(self.bulk('delete', ids=[self.new.pk]).status_code, status.HTTP_403_FORBIDDEN)
+        self.assertTrue(Lead.objects.filter(pk=self.new.pk).exists())
+
+        self.as_user(self.admin)
+        response = self.bulk('delete', ids=[self.converted.pk, self.new.pk, 999999, self.lost.pk])
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data['succeeded'], [self.new.pk, self.lost.pk])
+        self.assertEqual(self.failures(response), {
+            self.converted.pk: "This lead has records that depend on it, such as its Work, so it can't be deleted.",
+            999999: "This record no longer exists, or you don't have access to it.",
+        })
+        self.assertEqual(set(Lead.objects.values_list('name', flat=True)), {'Hot Lead', 'Won Lead', 'Converted Lead', 'B Lead'})
+        self.assertFalse(Activity.objects.filter(lead_id=self.new.pk).exists())
+        self.assertEqual(Work.objects.count(), 1)
+        self.assertEqual(set(User.objects.values_list('email', flat=True)), {'admin@example.com', 'admin2@example.com', 'a@example.com', 'b@example.com'})
+
+    def test_bulk_actions_follow_the_lead_permissions(self):
+        Role.objects.get(name=Role.STAFF).permissions.clear()
+        self.as_user(self.staff_a)
+        for name in ('status', 'convert', 'delete'):
+            body = {'ids': [self.new.pk], **({'status': 'HOT'} if name == 'status' else {})}
+            self.assertEqual(self.bulk(name, **body).status_code, status.HTTP_403_FORBIDDEN, name)
+        self.client.force_authenticate(None)
+        self.assertEqual(self.bulk('status', ids=[self.new.pk], status='HOT').status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertEqual(Lead.objects.get(pk=self.new.pk).status, S.NEW)

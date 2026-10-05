@@ -37,7 +37,8 @@ class Activity(models.Model):
 
     # A lead's activities are part of it, so deleting the lead (an admin action) deletes them too.
     lead = models.ForeignKey('leads.Lead', on_delete=models.CASCADE, null=True, blank=True, related_name='activities')
-    # A Work's activities are its history. Works are never deleted.
+    # A Work's activities are its history and go with it: an admin can delete Works in bulk from the list, and a CRM
+    # reset removes them all.
     work = models.ForeignKey('works.Work', on_delete=models.CASCADE, null=True, blank=True, related_name='activities')
     # A lead's follow-up: required for every new or edited one (the API checks it). Follow-ups added before headings
     # existed, and Work activities, keep an empty one rather than an invented one.
@@ -100,3 +101,9 @@ class Activity(models.Model):
 
     def __str__(self):
         return self.title or f'{self.get_type_display()}: {self.lead or self.work}'
+
+    def status_changeable_by(self, user):
+        """Whether `user` may complete or reopen this activity, on top of being allowed to edit it at all: an admin, the
+        staff member it is assigned to, or (for an activity assigned to no one) anyone who can edit it. Another staff
+        member can see it but never changes its status."""
+        return user.role_id == Role.ADMIN or self.assigned_to_id is None or self.assigned_to_id == user.pk

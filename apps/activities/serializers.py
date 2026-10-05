@@ -75,6 +75,8 @@ class ActivitySerializer(serializers.ModelSerializer):
     can_edit = serializers.SerializerMethodField()
     can_delete = serializers.SerializerMethodField()
     can_open_lead = serializers.SerializerMethodField()
+    # Completing or reopening it: the assignee or an admin (Activity.status_changeable_by); the API refuses anyone else.
+    can_update_status = serializers.SerializerMethodField()
 
     class Meta:
         model = Activity
@@ -82,7 +84,7 @@ class ActivitySerializer(serializers.ModelSerializer):
             'id', 'lead', 'work', 'lead_name', 'lead_country_code', 'lead_phone',
             'title', 'type', 'type_display', 'assigned_to', 'assigned_to_name', 'due_date', 'description', 'status',
             'completed_at', 'completed_by_name', 'created_by_name', 'created_at', 'updated_at', 'work_summary',
-            'can_edit', 'can_delete', 'can_open_lead',
+            'can_edit', 'can_delete', 'can_open_lead', 'can_update_status',
         ]
         read_only_fields = ['id', 'completed_at', 'created_at', 'updated_at']
 
@@ -130,6 +132,9 @@ class ActivitySerializer(serializers.ModelSerializer):
 
     def get_can_open_lead(self, activity):
         return activity.lead_id is not None and self.works_the_lead(activity)
+
+    def get_can_update_status(self, activity):
+        return self.get_can_edit(activity) and activity.status_changeable_by(self.context['request'].user)
 
     def validate_lead(self, lead):
         if self.instance and lead != self.instance.lead:

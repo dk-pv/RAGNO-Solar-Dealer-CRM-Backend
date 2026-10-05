@@ -1,6 +1,7 @@
 import csv
 
 from django.contrib.auth import get_user_model
+from django.db import transaction
 from django.db.models import Case, F, IntegerField, ProtectedError, Value, When
 from django.http import HttpResponse
 from django.utils import timezone
@@ -13,9 +14,42 @@ from rest_framework.response import Response
 
 from apps.accounts.models import Role
 from apps.accounts.permissions import IsAdminRole, ModelPermissions
+from apps.notifications import services as notifications
 
-from .models import Lead, LeadStatus, SolarPlan
-from .serializers import LeadQuerySerializer, LeadSerializer, SolarPlanSerializer, StatusChangeSerializer
+from .models import Lead, LeadConflict, LeadStatus, SolarPlan
+from .serializers import (
+    BulkIdsSerializer, BulkStatusSerializer, LeadQuerySerializer, LeadSerializer, SolarPlanSerializer,
+    StatusChangeSerializer,
+)
+
+PROTECTED_LEAD = "This lead has records that depend on it, such as its Work, so it can't be deleted."
+MISSING_RECORD = "This record no longer exists, or you don't have access to it."
+
+
+def bulk_apply(records, ids, apply, label=str):
+    """Runs `apply(record)` on each of the user's `records` whose id is in `ids`, each in its own savepoint, so one
+    refusal (a LeadConflict, a ProtectedError) rolls back only that record and the rest still go through. Answers which
+    ids succeeded and, for each that didn't, its `label` and why, in words meant for the screen. An id outside `records`
+    (gone, or another person's) fails as not found: a bulk action never reaches further than the single-record actions."""
+    found = {record.pk: record for record in records.filter(pk__in=ids)}
+    succeeded, failed = [], []
+    # Ascending id: a row lock (move_to, convert) lasts until the request commits, so two concurrent bulk actions on
+    # the same rows take the locks in the same order and can't deadlock.
+    for record_id in sorted(ids):
+        record = found.get(record_id)
+        if record is None:
+            failed.append({'id': record_id, 'name': None, 'reason': MISSING_RECORD})
+            continue
+        try:
+            with transaction.atomic():
+                apply(record)
+        except LeadConflict as refusal:
+            failed.append({'id': record_id, 'name': label(record), 'reason': str(refusal.detail)})
+        except ProtectedError:
+            failed.append({'id': record_id, 'name': label(record), 'reason': PROTECTED_LEAD})
+        else:
+            succeeded.append(record_id)  # not record.pk: a deleted record's pk is cleared
+    return Response({'succeeded': succeeded, 'failed': failed})
 
 User = get_user_model()
 
@@ -69,6 +103,13 @@ class CanChangeLeads(BasePermission):
         return request.user.has_perm('leads.change_lead')
 
 
+class CanDeleteLeads(BasePermission):
+    """The Leads module doesn't give staff the delete permission: in practice, admins."""
+
+    def has_permission(self, request, view):
+        return request.user.has_perm('leads.delete_lead')
+
+
 class LeadPagination(PageNumberPagination):
     page_size_query_param = 'page_size'
     max_page_size = 100
@@ -99,8 +140,10 @@ class LeadViewSet(
         if self.action == 'export':
             # The whole customer list with phone numbers leaves the system: admins only.
             return [IsAdminRole()]
-        if self.action in ('change_status', 'convert'):
+        if self.action in ('change_status', 'convert', 'bulk_status', 'bulk_convert'):
             return [CanChangeLeads()]
+        if self.action == 'bulk_delete':
+            return [CanDeleteLeads()]
         if self.action == 'assignees':
             return [CanViewLeads()]
         return [ModelPermissions()]
@@ -109,16 +152,21 @@ class LeadViewSet(
         user = self.request.user
         # A lead staff add is theirs: assigned to them, so it stays in their list. Admins assign anyone.
         extra = {} if user.role_id == Role.ADMIN else {'assigned_to': user}
-        serializer.save(created_by=user, **extra)
+        lead = serializer.save(created_by=user, **extra)
+        notifications.lead_created(lead, user)
+        # The initial follow-up added with the lead, if any, has its own assignee.
+        for follow_up in lead.activities.select_related('assigned_to', 'lead'):
+            notifications.activity_assigned(follow_up, user)
 
     def destroy(self, request, *args, **kwargs):
         try:
             return super().destroy(request, *args, **kwargs)
         except ProtectedError:
-            return Response(
-                {'detail': "This lead has records that depend on it, such as its Work, so it can't be deleted."},
-                status=status.HTTP_409_CONFLICT,
-            )
+            return Response({'detail': PROTECTED_LEAD}, status=status.HTTP_409_CONFLICT)
+
+    def convert_and_notify(self, lead):
+        lead.convert(self.request.user)
+        notifications.lead_converted(lead, self.request.user)
 
     @action(detail=True, methods=['post'], url_path='status')
     def change_status(self, request, pk=None):
@@ -131,8 +179,30 @@ class LeadViewSet(
     @action(detail=True, methods=['post'])
     def convert(self, request, pk=None):
         lead = self.get_object()
-        lead.convert(request.user)
+        self.convert_and_notify(lead)
         return Response(self.get_serializer(lead).data)
+
+    # The bulk actions act on the rows selected in the list, each through the same rules as its single-record action
+    # (Lead.move_to, Lead.convert, delete with its PROTECT keys), and answer per lead (see bulk_apply).
+
+    @action(detail=False, methods=['post'], url_path='bulk-status')
+    def bulk_status(self, request):
+        body = BulkStatusSerializer(data=request.data)
+        body.is_valid(raise_exception=True)
+        new_status = body.validated_data['status']
+        return bulk_apply(self.get_queryset(), body.validated_data['ids'], lambda lead: lead.move_to(new_status))
+
+    @action(detail=False, methods=['post'], url_path='bulk-convert')
+    def bulk_convert(self, request):
+        body = BulkIdsSerializer(data=request.data)
+        body.is_valid(raise_exception=True)
+        return bulk_apply(self.get_queryset(), body.validated_data['ids'], self.convert_and_notify)
+
+    @action(detail=False, methods=['post'], url_path='bulk-delete')
+    def bulk_delete(self, request):
+        body = BulkIdsSerializer(data=request.data)
+        body.is_valid(raise_exception=True)
+        return bulk_apply(self.get_queryset(), body.validated_data['ids'], lambda lead: lead.delete())
 
     @action(detail=False, methods=['get'])
     def export(self, request):

@@ -147,6 +147,19 @@ class StatusChangeSerializer(serializers.Serializer):
     status = serializers.ChoiceField(choices=LeadStatus.choices)
 
 
+class BulkIdsSerializer(serializers.Serializer):
+    """The records a bulk action is for: the ids of the rows selected on one page (the largest page holds 100)."""
+
+    ids = serializers.ListField(child=serializers.IntegerField(min_value=1), min_length=1, max_length=100)
+
+    def validate_ids(self, ids):
+        return list(dict.fromkeys(ids))  # each once, in the order sent
+
+
+class BulkStatusSerializer(BulkIdsSerializer):
+    status = serializers.ChoiceField(choices=LeadStatus.choices)
+
+
 class LeadQuerySerializer(serializers.Serializer):
     """The list's query parameters: an unknown status or a malformed date is a 400, never a silently ignored filter."""
 

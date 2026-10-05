@@ -158,6 +158,9 @@ class Lead(models.Model):
         with transaction.atomic():
             # Locked, so two people changing the same lead can't both act on its old status.
             lead = Lead.objects.select_for_update().get(pk=self.pk)
+            if new_status == lead.status:
+                # Reachable through the bulk status action (a lead already in the chosen status).
+                raise LeadConflict(f'The lead is already {lead.get_status_display()}.')
             if new_status not in lead.allowed_transitions():
                 label = dict(LeadStatus.choices).get(new_status, new_status)
                 raise LeadConflict(f"A {lead.get_status_display()} lead can't move to {label}.")

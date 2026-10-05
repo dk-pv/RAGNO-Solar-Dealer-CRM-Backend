@@ -1,6 +1,8 @@
 from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
+from apps.leads.serializers import BulkIdsSerializer  # noqa: F401 (the Works views take it from here)
+
 from .models import Work, WorkStage
 
 User = get_user_model()
@@ -47,6 +49,10 @@ class WorkSerializer(serializers.ModelSerializer):
         if user and not user.is_active and user != getattr(self.instance, 'assigned_to', None):
             raise serializers.ValidationError('Select an active user.')
         return user
+
+
+class BulkStageSerializer(BulkIdsSerializer):
+    stage = serializers.ChoiceField(choices=WorkStage.choices)
 
 
 class WorkQuerySerializer(serializers.Serializer):
