@@ -585,6 +585,32 @@ class LeadAccessTests(APITestCase):
         self.assertEqual(self.client.get(reverse('lead-list')).status_code, status.HTTP_403_FORBIDDEN)
         self.assertEqual(self.client.get(reverse('lead-detail', args=[self.a_lead.pk])).status_code, 403)
 
+    def test_the_summary_counts_and_totals_each_status_for_the_leads_the_user_works_with(self):
+        make_lead(self.plan, self.admin, name='Custom', phone='9876500007', amount=Decimal('150000.50'))
+        self.as_user(self.admin)
+        summary = {row['status']: row for row in self.client.get(reverse('lead-summary')).data}
+        self.assertEqual(list(summary), S.values)
+        self.assertEqual(
+            (summary['NEW']['label'], summary['NEW']['count'], summary['NEW']['total_amount']), ('New', 3, '550000.50'),
+        )
+        self.assertEqual((summary['SUPERHOT']['count'], summary['SUPERHOT']['total_amount']), (1, '200000.00'))
+        self.assertEqual((summary['WON']['count'], summary['WON']['total_amount']), (0, '0.00'))
+        # The list's search and filters apply, and are validated as the list's are.
+        searched = {row['status']: row['count'] for row in self.client.get(reverse('lead-summary'), {'search': 'Pool'}).data}
+        self.assertEqual((searched['NEW'], searched['SUPERHOT']), (1, 0))
+        only = {row['status']: row['count'] for row in self.client.get(reverse('lead-summary'), {'status': 'SUPERHOT'}).data}
+        self.assertEqual((only['NEW'], only['SUPERHOT']), (0, 1))
+        self.assertEqual(self.client.get(reverse('lead-summary'), {'status': 'CONFIRMED'}).status_code, 400)
+        # Staff get the numbers of their own leads only; without the Leads module, or signed out, nothing.
+        self.as_user(self.staff_a)
+        own = {row['status']: row for row in self.client.get(reverse('lead-summary')).data}
+        self.assertEqual((own['NEW']['count'], own['SUPERHOT']['count'], own['SUPERHOT']['total_amount']), (0, 1, '200000.00'))
+        Role.objects.get(name=Role.STAFF).permissions.clear()
+        self.as_user(self.staff_a)
+        self.assertEqual(self.client.get(reverse('lead-summary')).status_code, status.HTTP_403_FORBIDDEN)
+        self.client.force_authenticate(None)
+        self.assertEqual(self.client.get(reverse('lead-summary')).status_code, status.HTTP_401_UNAUTHORIZED)
+
 @override_settings(DEBUG=True)
 class SeedDemoLeadsTests(TestCase):
     def seed(self):

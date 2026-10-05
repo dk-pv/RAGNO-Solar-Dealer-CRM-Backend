@@ -1,8 +1,9 @@
 import csv
+from decimal import Decimal
 
 from django.contrib.auth import get_user_model
 from django.db import transaction
-from django.db.models import Case, F, IntegerField, ProtectedError, Value, When
+from django.db.models import Case, Count, F, IntegerField, ProtectedError, Sum, Value, When
 from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework import mixins, status, viewsets
@@ -132,7 +133,7 @@ class LeadViewSet(
 
     def get_queryset(self):
         leads = Lead.objects.visible_to(self.request.user).select_related('plan', 'assigned_to', 'created_by', 'work')
-        if self.action in ('list', 'export'):
+        if self.action in ('list', 'export', 'summary'):
             return filter_leads(leads, self.request.query_params)
         return leads
 
@@ -144,9 +145,26 @@ class LeadViewSet(
             return [CanChangeLeads()]
         if self.action == 'bulk_delete':
             return [CanDeleteLeads()]
-        if self.action == 'assignees':
+        if self.action in ('assignees', 'summary'):
             return [CanViewLeads()]
         return [ModelPermissions()]
+
+    @action(detail=False)
+    def summary(self, request):
+        """Every status with its number of leads and their total amount, for the list's search and filters: what the
+        Lead Pipeline's columns show, as the Works summary does for its stages. Staff get their own leads' numbers."""
+        rows = self.get_queryset().order_by().values('status').annotate(count=Count('id'), total=Sum('amount'))
+        totals = {row['status']: row for row in rows}
+        return Response([
+            {
+                'status': value,
+                'label': label,
+                'count': totals.get(value, {}).get('count', 0),
+                # Money is a two-decimal string, as the lead's own amount is, whatever the database returns for a sum.
+                'total_amount': str((totals.get(value, {}).get('total') or Decimal(0)).quantize(Decimal('0.01'))),
+            }
+            for value, label in LeadStatus.choices
+        ])
 
     def perform_create(self, serializer):
         user = self.request.user
