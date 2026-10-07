@@ -167,6 +167,14 @@ SIMPLE_JWT = {
 CORS_ALLOWED_ORIGINS = env_list('CORS_ALLOWED_ORIGINS', 'http://localhost:3000')
 
 
+# Work documents (apps/works/storage.py) are kept privately in Cloudinary. Not required to start: until all three are
+# set, uploads and downloads fail with a message in the server log, and the rest of the CRM works. Django's error pages
+# hide settings named like *_KEY and *_SECRET.
+CLOUDINARY_CLOUD_NAME = os.environ.get('CLOUDINARY_CLOUD_NAME', '')
+CLOUDINARY_API_KEY = os.environ.get('CLOUDINARY_API_KEY', '')
+CLOUDINARY_API_SECRET = os.environ.get('CLOUDINARY_API_SECRET', '')
+
+
 # Logging
 
 # Errors go to the server's output (which gunicorn and the host capture). Django's defaults send them only by email to
