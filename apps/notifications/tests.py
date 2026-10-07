@@ -110,8 +110,9 @@ class NotificationEventTests(NotificationTestCase):
             lead=lead, title='Site visit', type='SITE_VISIT', assigned_to=self.staff_a, due_date=date(2026, 10, 10),
             created_by=self.admin,
         )
+        # Staff complete their own with the complete action (editing is an admin's).
         self.as_user(self.staff_a)
-        done = self.client.patch(reverse('activity-detail', args=[activity.pk]), {'status': 'COMPLETED'}, format='json')
+        done = self.client.post(reverse('activity-complete', args=[activity.pk]), format='json')
         self.assertEqual(done.status_code, status.HTTP_200_OK, done.data)
         for admin in (self.admin, self.admin_2):
             [notice] = self.received(admin)

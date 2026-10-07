@@ -2,13 +2,12 @@ from rest_framework.permissions import BasePermission, DjangoModelPermissions
 
 from .models import Role
 
-# Module access. Each module a role can be given is a named bundle of the Django permissions its API checks, so giving
-# the STAFF role a module in Settings → Roles & Access grants exactly what the backend enforces. ADMIN has every module.
+# Module access. Each module is a named bundle of the Django permissions its API checks. ADMIN has every module; the
+# STAFF role can only be given Activities, in Settings → Roles & Access (RoleSerializer refuses the others).
 # Every permission listed must be a real, migrated permission.
 MODULES = {
-    # Modules without models of their own use one access permission. The Work API checks accounts.access_work and
-    # the Lead Activities page's list accounts.access_activities; Dashboard and Reports have no backend yet and must
-    # check theirs when they are built.
+    # Modules without models of their own use one access permission: the Work, Activities, Dashboard and Reports APIs
+    # check accounts.access_work, access_activities, access_dashboard and access_reports.
     'dashboard': {'label': 'Dashboard', 'permissions': ['accounts.access_dashboard']},
     'leads': {'label': 'Leads', 'permissions': ['leads.view_lead', 'leads.add_lead', 'leads.change_lead']},
     'work': {'label': 'Work', 'permissions': ['accounts.access_work']},

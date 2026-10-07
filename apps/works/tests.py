@@ -218,26 +218,31 @@ class WorkActivityTests(WorkTestCase):
         return [(row['description'], row['status']) for row in response.data['results']]
 
     def test_add_edit_complete_and_reopen_a_follow_up(self):
-        self.client.force_authenticate(self.give_staff_work_access())
+        self.client.force_authenticate(self.admin)
 
         created = self.add(assigned_to=self.staff.pk, due_date='2026-09-12')
         self.assertEqual(created.status_code, status.HTTP_201_CREATED, created.data)
         self.assertEqual(
             (created.data['status'], created.data['assigned_to_name'], created.data['created_by_name'], created.data['lead']),
-            ('PENDING', 'Priya Nair', 'Priya Nair', None),
+            ('PENDING', 'Priya Nair', 'Admin', None),
         )
         url = reverse('activity-detail', args=[created.data['id']])
 
         edited = self.client.patch(url, {'description': 'Roof survey booked.', 'due_date': '2026-09-15'}, format='json')
         completed = self.client.patch(url, {'status': 'COMPLETED'}, format='json')
         self.assertEqual((edited.data['description'], edited.data['due_date']), ('Roof survey booked.', '2026-09-15'))
-        self.assertEqual((completed.data['status'], completed.data['completed_by_name']), ('COMPLETED', 'Priya Nair'))
+        self.assertEqual((completed.data['status'], completed.data['completed_by_name']), ('COMPLETED', 'Admin'))
         self.assertIsNotNone(completed.data['completed_at'])
         # Editing changes the one activity; completing keeps it in the Work's history.
         self.assertEqual(self.listed(), [('Roof survey booked.', 'COMPLETED')])
 
         reopened = self.client.patch(url, {'status': 'PENDING'}, format='json')
         self.assertEqual((reopened.data['completed_at'], reopened.data['completed_by_name']), (None, None))
+        # Adding, editing and reopening are an admin's: staff with the Work module see their own, and change nothing.
+        self.client.force_authenticate(self.give_staff_work_access())
+        self.assertEqual(self.add(assigned_to=self.staff.pk).status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(self.client.patch(url, {'description': 'Changed.'}, format='json').status_code, 403)
+        self.assertEqual(self.listed(), [('Roof survey booked.', 'PENDING')])
 
     def test_pending_come_first_soonest_due_first_and_the_work_reports_its_activities(self):
         self.client.force_authenticate(self.admin)
@@ -272,7 +277,8 @@ class WorkActivityTests(WorkTestCase):
 
         self.assertEqual(self.client.get(reverse('activity-list'), {'work': self.work.pk}).status_code, 403)
         self.assertEqual(self.add().status_code, status.HTTP_403_FORBIDDEN)
-        self.assertEqual(self.client.patch(url, {'status': 'COMPLETED'}, format='json').status_code, 404)
+        self.assertEqual(self.client.patch(url, {'status': 'COMPLETED'}, format='json').status_code, 403)
+        self.assertEqual(Activity.objects.get(pk=activity).status, 'PENDING')
         self.client.force_authenticate(None)
         self.assertEqual(self.client.get(reverse('activity-list'), {'work': self.work.pk}).status_code, 401)
 
@@ -291,9 +297,11 @@ class WorkActivityTests(WorkTestCase):
         self.client.force_authenticate(self.give_staff_work_access())
 
         self.assertEqual(self.client.get(reverse('activity-list'), {'lead': lead.pk}).status_code, 403)
-        self.assertEqual(self.client.get(reverse('activity-detail', args=[on_lead])).status_code, 404)
-        # A lead smuggled in beside the Work isn't accepted either.
-        self.assertEqual(self.add(lead=lead.pk).status_code, status.HTTP_400_BAD_REQUEST)
+        # Opening one, even one assigned to them, needs the Activities module.
+        self.assertEqual(self.client.get(reverse('activity-detail', args=[on_lead])).status_code, 403)
+        # Adding is an admin's, so a lead smuggled in beside the Work isn't accepted either.
+        self.assertEqual(self.add(lead=lead.pk).status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(Activity.objects.count(), 1)
 
     def test_activities_belong_to_one_work_for_good_and_are_never_deleted(self):
         other = convert_lead(self.plan, self.admin, phone='9876500002')
@@ -378,16 +386,14 @@ class WorkActivitiesPageTests(WorkTestCase):
         self.assertEqual(added.status_code, status.HTTP_201_CREATED, added.data)
         self.assertNotIn('Lead.', [description for _, description in self.listed()])
 
-    def test_the_page_needs_the_work_and_activities_modules(self):
+    def test_the_page_needs_only_the_activities_module(self):
         staff_role = Role.objects.get(pk=Role.STAFF)
         self.client.force_authenticate(self.give_staff_work_access())
         self.assertEqual(self.client.get(reverse('activity-works')).status_code, status.HTTP_403_FORBIDDEN)
-        staff_role.permissions.add(Permission.objects.get(codename='access_activities'))
+        staff_role.permissions.set([Permission.objects.get(codename='access_activities')])
         self.client.force_authenticate(User.objects.get(pk=self.staff.pk))
-        self.assertEqual(self.client.get(reverse('activity-works')).status_code, status.HTTP_200_OK)
-        staff_role.permissions.remove(Permission.objects.get(codename='access_work'))
-        self.client.force_authenticate(User.objects.get(pk=self.staff.pk))
-        self.assertEqual(self.client.get(reverse('activity-works')).status_code, status.HTTP_403_FORBIDDEN)
+        # Without the Work module too, listing only the staff member's own activities.
+        self.assertEqual(self.listed(), [(self.first.pk, 'Collect KSEB documents.')])
         self.client.force_authenticate(None)
         self.assertEqual(self.client.get(reverse('activity-works')).status_code, status.HTTP_401_UNAUTHORIZED)
 

@@ -48,7 +48,8 @@ class ActivitySerializer(serializers.ModelSerializer):
     - A lead's follow-up needs a heading, its staff (assigned as leads are) and a due date; notes are optional. It starts
       Pending whatever the request says, and Completed is final.
     - A Work's activity needs notes; its staff and due date are optional. It can be added completed, and reopened.
-    Completing records when and by whom; reopening clears it."""
+    Completing records when and by whom (and, through the complete action, an optional note); reopening clears them.
+    Only admins add, edit and delete activities (ActivityAccess)."""
 
     # Exactly one of the two, chosen when it is added: the lead or the Work it belongs to.
     lead = serializers.PrimaryKeyRelatedField(queryset=Lead.objects.none(), pk_field=serializers.IntegerField(), required=False)
@@ -75,7 +76,7 @@ class ActivitySerializer(serializers.ModelSerializer):
     can_edit = serializers.SerializerMethodField()
     can_delete = serializers.SerializerMethodField()
     can_open_lead = serializers.SerializerMethodField()
-    # Completing or reopening it: the assignee or an admin (Activity.status_changeable_by); the API refuses anyone else.
+    # Completing it (the complete action): an admin, or the staff member it is assigned to.
     can_update_status = serializers.SerializerMethodField()
 
     class Meta:
@@ -83,10 +84,11 @@ class ActivitySerializer(serializers.ModelSerializer):
         fields = [
             'id', 'lead', 'work', 'lead_name', 'lead_country_code', 'lead_phone',
             'title', 'type', 'type_display', 'assigned_to', 'assigned_to_name', 'due_date', 'description', 'status',
-            'completed_at', 'completed_by_name', 'created_by_name', 'created_at', 'updated_at', 'work_summary',
-            'can_edit', 'can_delete', 'can_open_lead', 'can_update_status',
+            'completed_at', 'completed_by_name', 'completion_note', 'created_by_name', 'created_at', 'updated_at',
+            'work_summary', 'can_edit', 'can_delete', 'can_open_lead', 'can_update_status',
         ]
-        read_only_fields = ['id', 'completed_at', 'created_at', 'updated_at']
+        # The completion note is written only by the complete action.
+        read_only_fields = ['id', 'completed_at', 'completion_note', 'created_at', 'updated_at']
 
     def get_fields(self):
         fields = super().get_fields()
@@ -122,19 +124,22 @@ class ActivitySerializer(serializers.ModelSerializer):
         return user.role_id == Role.ADMIN or activity.lead.assigned_to_id == user.pk
 
     def get_can_edit(self, activity):
-        permission = 'accounts.access_work' if activity.work_id else 'leads.change_lead'
-        return self.context['request'].user.has_perm(permission)
+        # Editing, reassigning and reopening are for admins; staff complete their own activities.
+        return self.context['request'].user.role_id == Role.ADMIN
 
     def get_can_delete(self, activity):
-        # A Work's activities are kept as its history. A lead's follow-up is deleted by whoever works the lead; staff
-        # who only do the follow-up can complete and edit it, not delete it.
+        # A Work's activities are kept as its history; a lead's follow-up is deleted by an admin.
         return activity.lead_id is not None and self.get_can_edit(activity) and self.works_the_lead(activity)
 
     def get_can_open_lead(self, activity):
-        return activity.lead_id is not None and self.works_the_lead(activity)
+        # A link to its lead only for someone who can open that page: the Leads module, and the lead theirs.
+        user = self.context['request'].user
+        return activity.lead_id is not None and user.has_perm('leads.view_lead') and self.works_the_lead(activity)
 
     def get_can_update_status(self, activity):
-        return self.get_can_edit(activity) and activity.status_changeable_by(self.context['request'].user)
+        # As ActivityAccess allows the complete action: the Activities module, and the activity theirs (any, for an admin).
+        user = self.context['request'].user
+        return user.has_perm('accounts.access_activities') and activity.status_changeable_by(user)
 
     def validate_lead(self, lead):
         if self.instance and lead != self.instance.lead:
@@ -156,12 +161,14 @@ class ActivitySerializer(serializers.ModelSerializer):
         errors = self.check_work_activity(attrs) if on_work else self.check_follow_up(attrs)
         if errors:
             raise serializers.ValidationError(errors)
-        # Completing records when and by whom; reopening (a Work's activity) clears it.
+        # Completing records when and by whom; reopening (a Work's activity) clears that and the completion note.
         status = attrs.get('status')
         if status and status != getattr(self.instance, 'status', ActivityStatus.PENDING):
             completed = status == ActivityStatus.COMPLETED
             attrs['completed_at'] = timezone.now() if completed else None
             attrs['completed_by'] = self.context['request'].user if completed else None
+            if not completed:
+                attrs['completion_note'] = ''
         return attrs
 
     def check_follow_up(self, attrs):
@@ -202,6 +209,12 @@ class ActivitySerializer(serializers.ModelSerializer):
         if user and not user.is_active and user != getattr(self.instance, 'assigned_to', None):
             errors['assigned_to'] = ['Select an active user.']
         return errors
+
+
+class CompletionSerializer(serializers.Serializer):
+    """Marking an activity completed: an optional short note on what was done, trimmed."""
+
+    completion_note = serializers.CharField(max_length=1000, allow_blank=True, default='')
 
 
 class ActivityQuerySerializer(serializers.Serializer):

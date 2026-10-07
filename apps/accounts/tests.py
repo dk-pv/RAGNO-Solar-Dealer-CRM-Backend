@@ -395,18 +395,18 @@ class RoleAccessTests(APITestCase):
         other_staff = User.objects.create_user(email='other@example.com', password=PASSWORD, name='Other')
         self.client.force_authenticate(self.admin)
 
-        response = self.set_role_modules(Role.STAFF, ['settings'])
+        response = self.set_role_modules(Role.STAFF, ['activities'])
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.data['modules'], ['settings'])
-        self.assertEqual(Role.objects.get(pk=Role.STAFF).permission_names, set(MODULES['settings']['permissions']))
+        self.assertEqual(response.data['modules'], ['activities'])
+        self.assertEqual(Role.objects.get(pk=Role.STAFF).permission_names, set(MODULES['activities']['permissions']))
         for user in (self.staff, other_staff):
             with self.subTest(user=user.email):
-                self.assertTrue(User.objects.get(pk=user.pk).has_perms(MODULES['settings']['permissions']))
+                self.assertTrue(User.objects.get(pk=user.pk).has_perms(MODULES['activities']['permissions']))
         self.assertFalse(User.objects.get(pk=self.staff.pk).user_permissions.exists())
 
-        self.set_role_modules(Role.STAFF, [])
-        self.assertFalse(User.objects.get(pk=self.staff.pk).has_perm('accounts.view_user'))
+        self.assertEqual(self.set_role_modules(Role.STAFF, []).status_code, status.HTTP_200_OK)
+        self.assertFalse(User.objects.get(pk=self.staff.pk).has_perm('accounts.access_activities'))
 
     def test_role_access_is_enforced_by_the_api(self):
         self.client.force_authenticate(self.staff)
@@ -414,9 +414,8 @@ class RoleAccessTests(APITestCase):
             with self.subTest(url=url, access=False):
                 self.assertEqual(self.client.get(url).status_code, status.HTTP_403_FORBIDDEN)
 
-        self.client.force_authenticate(self.admin)
-        self.set_role_modules(Role.STAFF, ['settings'])
-        self.client.force_authenticate(User.objects.get(pk=self.staff.pk))
+        # Roles & Access can't give staff Settings any more; a role that holds it anyway still gets only read access.
+        self.client.force_authenticate(grant(self.staff, 'view_user', 'view_department'))
 
         for url in (reverse('user-list'), reverse('department-list')):
             with self.subTest(url=url, access=True):
@@ -430,31 +429,34 @@ class RoleAccessTests(APITestCase):
         self.assertEqual(create.status_code, status.HTTP_403_FORBIDDEN)
         self.assertEqual(self.client.get(reverse('role-list')).status_code, status.HTTP_403_FORBIDDEN)
 
-    def test_leads_access_on_the_staff_role_opens_the_leads_api(self):
+    def test_leads_access_cant_be_given_to_the_staff_role_so_the_leads_api_stays_closed(self):
         url = reverse('lead-list')
-        self.client.force_authenticate(self.staff)
+        self.client.force_authenticate(self.admin)
+
+        response = self.set_role_modules(Role.STAFF, ['leads'])
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.data['modules'], ['Staff can only be given the Activities module.'])
+        self.assertFalse(Role.objects.get(pk=Role.STAFF).permissions.exists())
+        self.client.force_authenticate(User.objects.get(pk=self.staff.pk))
         self.assertEqual(self.client.get(url).status_code, status.HTTP_403_FORBIDDEN)
 
-        self.client.force_authenticate(self.admin)
-        self.assertEqual(self.set_role_modules(Role.STAFF, ['leads']).data['modules'], ['leads'])
-        self.client.force_authenticate(User.objects.get(pk=self.staff.pk))
-
-        self.assertEqual(self.client.get(url).status_code, status.HTTP_200_OK)
-
-    def test_modules_without_their_own_backend_grant_their_access_permission(self):
+    def test_the_activities_module_grants_its_access_permission_and_no_other_module_reaches_staff(self):
         self.client.force_authenticate(self.admin)
 
-        response = self.set_role_modules(Role.STAFF, ['dashboard', 'work', 'activities'])
+        refused = self.set_role_modules(Role.STAFF, ['dashboard', 'work', 'activities'])
+        response = self.set_role_modules(Role.STAFF, ['activities'])
 
-        self.assertEqual(response.data['modules'], ['dashboard', 'work', 'activities'])
+        self.assertEqual(refused.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.data['modules'], ['activities'])
         staff = User.objects.get(pk=self.staff.pk)
-        self.assertTrue(staff.has_perms(['accounts.access_dashboard', 'accounts.access_work', 'accounts.access_activities']))
-        self.assertFalse(staff.has_perm('accounts.access_reports'))
+        self.assertTrue(staff.has_perm('accounts.access_activities'))
+        for permission in ('accounts.access_dashboard', 'accounts.access_work', 'accounts.access_reports'):
+            self.assertFalse(staff.has_perm(permission), permission)
 
     def test_staff_cannot_view_or_change_roles_even_with_settings_access(self):
-        self.client.force_authenticate(self.admin)
-        self.set_role_modules(Role.STAFF, ['settings'])
-        self.client.force_authenticate(User.objects.get(pk=self.staff.pk))
+        # Written to the role directly: Roles & Access can't give staff Settings any more.
+        self.client.force_authenticate(grant(self.staff, 'view_user', 'view_department'))
 
         responses = [
             self.client.get(reverse('role-list')),

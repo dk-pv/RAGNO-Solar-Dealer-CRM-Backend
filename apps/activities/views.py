@@ -1,33 +1,25 @@
 import re
 
 from django.db.models import Case, F, IntegerField, Q, Value, When
+from django.utils import timezone
 from rest_framework import mixins, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.pagination import PageNumberPagination
-from rest_framework.permissions import SAFE_METHODS, BasePermission
+from rest_framework.permissions import BasePermission
+from rest_framework.response import Response
 
 from apps.accounts.models import Role
 from apps.leads.models import Lead
 from apps.notifications import services as notifications
 
 from .models import Activity, ActivityStatus
-from .serializers import ActivityQuerySerializer, ActivitySerializer, WorkActivityQuerySerializer
+from .serializers import ActivityQuerySerializer, ActivitySerializer, CompletionSerializer, WorkActivityQuerySerializer
 
 NOT_YOUR_ACTIVITY = 'You can only update activities assigned to you.'
-NOT_YOUR_ASSIGNMENT = 'Only an admin can reassign an activity assigned to someone else.'
+ALREADY_COMPLETED = 'This activity is already completed.'
 
 PENDING_FIRST = Case(When(status=ActivityStatus.PENDING, then=Value(0)), default=Value(1), output_field=IntegerField())
-
-
-def mine_first(user):
-    """On the Activities pages, a staff member's own work comes first: the activities assigned to them, then those
-    assigned to others, then unassigned ones, each group in the page's chosen order. An admin's pages keep that order
-    alone: the pages are their overview of everyone's work."""
-    if user.role_id == Role.ADMIN:
-        return []
-    return [Case(When(assigned_to=user, then=Value(0)), When(assigned_to__isnull=False, then=Value(1)), default=Value(2),
-                 output_field=IntegerField())]
 # One Work's activities: pending first, the soonest due first; then completed, the latest first.
 WITHIN_WORK = [PENDING_FIRST, F('completed_at').desc(nulls_last=True), F('due_date').asc(nulls_last=True), '-created_at', '-id']
 # The Work Activities page. Every order but due date keeps each Work's activities together, in the order above.
@@ -47,15 +39,17 @@ def filter_follow_ups(follow_ups, query_params, user):
 
     if 'lead' in params:
         follow_ups = follow_ups.filter(lead_id=params['lead'])
-    # The heading or notes, or the lead it's for: its name, phone, email, place or ID, as the leads list searches them.
-    # A lead the user doesn't work (a follow-up merely assigned to them) matches only by what they're shown of it: its
-    # name, phone and ID.
+    # The heading or notes, or the lead it's for by what each row shows of it: its name, phone or ID. Its email and
+    # place too, as the leads list searches them, only for whoever can open their leads (the Leads module): staff who
+    # only have Activities never search a lead's other details.
     if search := params.get('search', '').strip():
-        follow_ups = follow_ups.filter(
+        match = (
             Q(title__icontains=search) | Q(description__icontains=search)
-            | Q(lead__in=Lead.objects.visible_to(user).search(search).values('pk'))
             | Q(lead__in=Lead.objects.search(search, details=False).values('pk'))
         )
+        if user.has_perm('leads.view_lead'):
+            match |= Q(lead__in=Lead.objects.visible_to(user).search(search).values('pk'))
+        follow_ups = follow_ups.filter(match)
     for field in ('status', 'type'):
         if field in params:
             follow_ups = follow_ups.filter(**{field: params[field]})
@@ -70,45 +64,35 @@ def filter_follow_ups(follow_ups, query_params, user):
     ordering = params.get('ordering', '-created_at')
     field = F('pending_rank' if ordering.lstrip('-') == 'status' else ordering.lstrip('-'))
     order = field.desc(nulls_last=True) if ordering.startswith('-') else field.asc(nulls_last=True)
-    # Sorting by status puts Pending first; the newest first among equals; the id keeps pages stable. The Lead Activities
-    # page (no one lead) lists a staff member's own follow-ups first; one lead's follow-ups keep the order asked for.
-    first = mine_first(user) if 'lead' not in params else []
-    return follow_ups.annotate(pending_rank=PENDING_FIRST).order_by(*first, order, '-created_at', '-id')
+    # Sorting by status puts Pending first; the newest first among equals; the id keeps pages stable.
+    return follow_ups.annotate(pending_rank=PENDING_FIRST).order_by(order, '-created_at', '-id')
 
 
-def required_permission(on_work, method):
-    """Activities follow what they belong to. A lead's follow-ups: reading needs the Leads view permission; adding,
-    editing, completing and deleting need the change permission. A Work's activities: the Work module, as the Work."""
-    if on_work:
-        return 'accounts.access_work'
-    return 'leads.view_lead' if method in SAFE_METHODS else 'leads.change_lead'
-
-
-class FollowsParentAccess(BasePermission):
-    """Which activities count is decided in get_queryset: a lead's follow-ups as Activity.objects.visible_to() says (all
-    for an admin; for staff, those on their own leads and those assigned to them), and every Work's activities with the
-    Work module. The pages that list many at once also need the Activities module."""
+class ActivityAccess(BasePermission):
+    """Who reaches which activities. Every list holds, and every single activity opens for, only what the user may see:
+    all of them for an admin; for staff only the activities assigned to them (Activity.objects.visible_to,
+    Activity.status_changeable_by), whatever lead or Work they are on.
+    - The Lead and Work Activities pages, and opening or completing one activity from them: the Activities module.
+    - A lead's or a Work's own list (on its page): the Leads or the Work module.
+    - Adding, editing (reassigning, reopening) and deleting: admins. Staff complete their own with the complete action,
+      which changes nothing else."""
 
     def has_permission(self, request, view):
         user = request.user
-        if view.action == 'works':
-            # Every Work's activities on one page: the Work module and the Activities module.
-            return user.has_perm('accounts.access_work') and user.has_perm('accounts.access_activities')
-        if view.action == 'list':
-            if 'work' in request.query_params:
-                return user.has_perm('accounts.access_work')
-            # One lead's follow-ups, or (no lead: a blank ?lead= filters nothing) the Lead Activities page.
-            if request.query_params.get('lead', '').strip():
-                return user.has_perm('leads.view_lead')
-            return user.has_perm('leads.view_lead') and user.has_perm('accounts.access_activities')
-        if view.action == 'create':
-            on_work = isinstance(request.data, dict) and 'work' in request.data
-            return user.has_perm(required_permission(on_work, request.method))
-        # A single activity: checked against its lead or Work below, once it is found among the visible ones.
-        return user.has_perm('leads.view_lead') or user.has_perm('accounts.access_work')
+        if view.action == 'list' and 'work' in request.query_params:
+            return user.has_perm('accounts.access_work')
+        # One lead's follow-ups; a blank ?lead= filters nothing (the Lead Activities page).
+        if view.action == 'list' and request.query_params.get('lead', '').strip():
+            return user.has_perm('leads.view_lead')
+        if view.action in ('list', 'works', 'retrieve', 'complete'):
+            return user.has_perm('accounts.access_activities')
+        return bool(user.is_authenticated and user.role_id == Role.ADMIN)
 
     def has_object_permission(self, request, view, activity):
-        return request.user.has_perm(required_permission(activity.work_id is not None, request.method))
+        # Another staff member's, an admin's or an unassigned activity is refused, never shown; an unknown id is a 404.
+        if not activity.status_changeable_by(request.user):
+            raise PermissionDenied(NOT_YOUR_ACTIVITY)
+        return True
 
 
 class ActivityPagination(PageNumberPagination):
@@ -126,21 +110,19 @@ class ActivityViewSet(
     viewsets.GenericViewSet,
 ):
     serializer_class = ActivitySerializer
-    permission_classes = [FollowsParentAccess]
+    permission_classes = [ActivityAccess]
     pagination_class = ActivityPagination
     lookup_value_regex = '[0-9]+'
 
     def get_queryset(self):
-        user = self.request.user
-        visible = Q(pk__in=[])
-        if user.has_perm('leads.view_lead'):
-            visible |= Q(pk__in=Activity.objects.visible_to(user).values('pk'))
-        if user.has_perm('accounts.access_work'):
-            visible |= Q(work__isnull=False)
         # The lead, the Work and its plan come in the same query: no query per row.
-        activities = Activity.objects.filter(visible).select_related(
-            'lead', 'work__plan', 'assigned_to', 'completed_by', 'created_by',
-        )
+        activities = Activity.objects.select_related('lead', 'work__plan', 'assigned_to', 'completed_by', 'created_by')
+        if self.detail:
+            # One activity is looked up among all of them: someone else's answers 403 (ActivityAccess), an unknown id 404.
+            # Completing locks it, so two requests at once (or a reassignment meanwhile) take turns.
+            return activities.select_for_update(of=('self',)) if self.action == 'complete' else activities
+        # Every list searches, filters, sorts, counts and pages only what the user may see.
+        activities = activities.visible_to(self.request.user)
         if self.action == 'list':
             # One Work's activities, or lead follow-ups (one lead's, or the Lead Activities page).
             work = self.request.query_params.get('work')
@@ -148,16 +130,13 @@ class ActivityViewSet(
                 if not re.fullmatch(r'[0-9]+', work):
                     raise ValidationError({'work': 'Choose a Work.'})
                 return activities.filter(work_id=int(work)).order_by(*WITHIN_WORK)
-            return filter_follow_ups(activities.filter(lead__isnull=False), self.request.query_params, user)
-        if self.action == 'destroy':
-            # Deleting a follow-up stays with whoever works the lead; staff who only do it complete it instead.
-            return activities.filter(Q(lead__in=Lead.objects.visible_to(user)) | Q(work__isnull=False))
+            return filter_follow_ups(activities.filter(lead__isnull=False), self.request.query_params, self.request.user)
         return activities
 
     @action(detail=False)
     def works(self, request):
-        """Every Work's activities, completed ones included, with search, filters and paging. Each Work's activities stay
-        together (newest Work first by default)."""
+        """The Work Activities page: every Work's activities the user may see (staff: their own), completed ones included,
+        with search, filters and paging. Each Work's activities stay together (newest Work first by default)."""
         query = WorkActivityQuerySerializer(data=request.query_params)
         query.is_valid(raise_exception=True)
         params = query.validated_data
@@ -181,27 +160,35 @@ class ActivityViewSet(
         if 'due_before' in params:
             activities = activities.filter(due_date__lte=params['due_before'])
 
-        order = [*mine_first(request.user), *WORK_ACTIVITY_ORDERS[params.get('ordering', '-work')]]
-        page = self.paginate_queryset(activities.order_by(*order))
+        page = self.paginate_queryset(activities.order_by(*WORK_ACTIVITY_ORDERS[params.get('ordering', '-work')]))
         return self.get_paginated_response(self.get_serializer(page, many=True).data)
+
+    @action(detail=True, methods=['post'])
+    def complete(self, request, pk=None):
+        """Marks a pending activity completed, with an optional note on what was done: its assignee (with the Activities
+        module) or an admin. Only once: a second request is refused and keeps the first note. Admins and the assignee are
+        told, as when an admin completes it by editing it."""
+        activity = self.get_object()
+        if activity.status == ActivityStatus.COMPLETED:
+            raise ValidationError({'status': [ALREADY_COMPLETED]})
+        completion = CompletionSerializer(data=request.data)
+        completion.is_valid(raise_exception=True)
+        activity.status, activity.completed_by = ActivityStatus.COMPLETED, request.user
+        activity.completed_at, activity.completion_note = timezone.now(), completion.validated_data['completion_note']
+        activity.save(update_fields=['status', 'completed_at', 'completed_by', 'completion_note', 'updated_at'])
+        notifications.activity_status_changed(activity, request.user)
+        return Response(self.get_serializer(activity).data)
 
     def perform_create(self, serializer):
         activity = serializer.save(created_by=self.request.user)
         notifications.activity_assigned(activity, self.request.user)
 
     def perform_update(self, serializer):
-        """Completing or reopening is for the assignee or an admin (Activity.status_changeable_by): anyone else who can
-        edit the activity is refused with 403 before anything is saved. The same goes for taking over an activity that is
-        assigned to someone else, so the rule can't be sidestepped by reassigning it first; an unassigned one may be taken.
-        Whoever it is newly assigned to is told, as are the admins and the assignee when its status changes."""
+        """Editing is for admins (ActivityAccess). Whoever it is newly assigned to is told, as are the admins and the
+        assignee when its status changes."""
         activity, user = serializer.instance, self.request.user
         changes = serializer.validated_data
         status_changes = 'status' in changes and changes['status'] != activity.status
-        if status_changes and not activity.status_changeable_by(user):
-            raise PermissionDenied(NOT_YOUR_ACTIVITY)
-        reassigns = 'assigned_to' in changes and changes['assigned_to'] != activity.assigned_to
-        if reassigns and not activity.status_changeable_by(user):
-            raise PermissionDenied(NOT_YOUR_ASSIGNMENT)
         assignee_before = activity.assigned_to_id
         activity = serializer.save()
         if activity.assigned_to_id != assignee_before:

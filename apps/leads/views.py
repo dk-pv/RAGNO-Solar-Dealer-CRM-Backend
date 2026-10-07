@@ -10,7 +10,7 @@ from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.generics import ListAPIView
 from rest_framework.pagination import PageNumberPagination
-from rest_framework.permissions import BasePermission, IsAuthenticated
+from rest_framework.permissions import BasePermission
 from rest_framework.response import Response
 
 from apps.accounts.models import Role
@@ -109,6 +109,13 @@ class CanDeleteLeads(BasePermission):
 
     def has_permission(self, request, view):
         return request.user.has_perm('leads.delete_lead')
+
+
+class CanUsePlans(BasePermission):
+    """The plans and their prices are for the Leads and Works screens: the Leads or the Work module."""
+
+    def has_permission(self, request, view):
+        return request.user.has_perm('leads.view_lead') or request.user.has_perm('accounts.access_work')
 
 
 class LeadPagination(PageNumberPagination):
@@ -253,9 +260,9 @@ class LeadViewSet(
 
 
 class SolarPlanListView(ListAPIView):
-    """Every plan with its current price, for the lead form and filters. Admins manage prices."""
+    """Every plan with its current price, for the lead and Work forms and filters. Admins manage prices."""
 
     queryset = SolarPlan.objects.all()
     serializer_class = SolarPlanSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [CanUsePlans]
     pagination_class = None

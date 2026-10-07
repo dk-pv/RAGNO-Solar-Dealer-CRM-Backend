@@ -31,7 +31,8 @@ class FollowUpTestCase(APITestCase):
         cls.admin = User.objects.create_user(email='admin@example.com', password=PASSWORD, name='Admin', role=Role.ADMIN)
         cls.staff_a = User.objects.create_user(email='a@example.com', password=PASSWORD, name='Staff A')
         cls.staff_b = User.objects.create_user(email='b@example.com', password=PASSWORD, name='Staff B')
-        # As an admin gives them to the STAFF role in Settings -> Roles & Access.
+        # Written to the role directly: Settings -> Roles & Access gives staff only Activities now, and these tests show
+        # the activity rules hold even for staff who also have the Leads module (test_staff_access.py: Activities only).
         grant(Role.objects.get(name=Role.STAFF), 'leads.view_lead', 'leads.add_lead', 'leads.change_lead',
               'accounts.access_activities')
         cls.plan = SolarPlan.objects.get(capacity=5)
@@ -61,6 +62,9 @@ class FollowUpTestCase(APITestCase):
 
     def patch(self, activity_id, **body):
         return self.client.patch(reverse('activity-detail', args=[activity_id]), body, format='json')
+
+    def complete(self, activity_id, **body):
+        return self.client.post(reverse('activity-complete', args=[activity_id]), body, format='json')
 
 
 class FollowUpFieldsTests(FollowUpTestCase):
@@ -101,39 +105,47 @@ class FollowUpFieldsTests(FollowUpTestCase):
         inactive = User.objects.create_user(email='gone@example.com', password=PASSWORD, name='Gone', is_active=False)
         self.assertEqual(self.add(self.a_lead, assigned_to=inactive.pk).status_code, status.HTTP_400_BAD_REQUEST)
 
-    def test_staff_assign_follow_ups_only_to_themselves(self):
+    def test_staff_can_not_add_or_edit_follow_ups_even_their_own(self):
         self.as_user(self.staff_a)
-        refused = self.add(self.a_lead, assigned_to=self.staff_b.pk)
-        self.assertEqual(refused.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertEqual(refused.data['assigned_to'][0], 'Only an admin can assign a follow-up to someone else.')
-        created = self.add(self.a_lead, assigned_to=self.staff_a.pk)
-        self.assertEqual(created.status_code, status.HTTP_201_CREATED, created.data)
-        self.assertEqual(self.patch(created.data['id'], assigned_to=self.staff_b.pk).status_code, 400)
-        # A follow-up an admin assigned to someone else keeps that person when staff edit it.
-        by_admin = Activity.objects.create(
-            lead=self.a_lead, title='Admin task', type='NOTE', assigned_to=self.admin, due_date=date(2026, 10, 4),
+        for assignee in (self.staff_a, self.staff_b):
+            self.assertEqual(self.add(self.a_lead, assigned_to=assignee.pk).status_code, 403, assignee.name)
+        self.assertFalse(Activity.objects.exists())
+        # Editing, and so reassigning, is an admin's too, even for the follow-up's own staff.
+        mine = Activity.objects.create(
+            lead=self.a_lead, title='Call Asha', type='PHONE_CALL', assigned_to=self.staff_a, due_date=date(2026, 10, 4),
             created_by=self.admin,
         )
-        kept = self.patch(by_admin.pk, title='Admin task (edited)', assigned_to=self.admin.pk)
-        self.assertEqual((kept.status_code, kept.data['assigned_to']), (200, self.admin.pk))
+        for body in ({'title': 'Call Asha (edited)'}, {'assigned_to': self.staff_b.pk}, {'assigned_to': self.staff_a.pk}):
+            self.assertEqual(self.patch(mine.pk, **body).status_code, status.HTTP_403_FORBIDDEN, body)
+        stored = Activity.objects.get(pk=mine.pk)
+        self.assertEqual((stored.title, stored.assigned_to), ('Call Asha', self.staff_a))
+        self.as_user(self.admin)
+        moved = self.patch(mine.pk, title='Call Asha (edited)', assigned_to=self.staff_b.pk)
+        self.assertEqual((moved.status_code, moved.data['assigned_to']), (200, self.staff_b.pk))
 
     def test_pending_to_completed_persists_and_completed_is_final(self):
-        self.as_user(self.staff_a)
+        self.as_user(self.admin)
         created = self.add(self.a_lead, assigned_to=self.staff_a.pk).data
-        done = self.patch(created['id'], status='COMPLETED')
+        # Its staff completes it.
+        self.as_user(self.staff_a)
+        done = self.complete(created['id'])
         self.assertEqual((done.status_code, done.data['status']), (200, 'COMPLETED'))
         self.assertEqual(Activity.objects.get(pk=created['id']).status, ActivityStatus.COMPLETED)
+        self.as_user(self.admin)
         reopened = self.patch(created['id'], status='PENDING')
         self.assertEqual(reopened.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(reopened.data['status'][0], 'A completed follow-up stays completed.')
         self.assertEqual(self.patch(created['id'], status='DONE').status_code, status.HTTP_400_BAD_REQUEST)
-        # A completed follow-up can still be edited.
+        # A completed follow-up can still be edited (by an admin).
         edited = self.patch(created['id'], title='Called; quotation sent', description='Sent by email.')
         self.assertEqual((edited.status_code, edited.data['status']), (200, 'COMPLETED'))
 
     def test_follow_ups_added_before_headings_staff_and_due_dates_still_load_and_can_be_completed(self):
         legacy = Activity.objects.create(lead=self.a_lead, type='NOTE', description='Old note.', created_by=self.admin)
+        # Assigned to no one, so only admins see it, even on Staff A's lead.
         self.as_user(self.staff_a)
+        self.assertEqual(self.page(lead=self.a_lead.pk)['count'], 0)
+        self.as_user(self.admin)
         row = self.page(lead=self.a_lead.pk)['results'][0]
         self.assertEqual((row['title'], row['assigned_to'], row['due_date'], row['status']), ('', None, None, 'PENDING'))
         self.assertEqual(self.patch(legacy.pk, status='COMPLETED').status_code, status.HTTP_200_OK)
@@ -141,6 +153,9 @@ class FollowUpFieldsTests(FollowUpTestCase):
         self.assertEqual(self.patch(legacy.pk, title='').status_code, status.HTTP_400_BAD_REQUEST)
         filled = self.patch(legacy.pk, title='Old note', assigned_to=self.staff_a.pk, due_date='2026-09-20')
         self.assertEqual(filled.status_code, status.HTTP_200_OK, filled.data)
+        # Now it is Staff A's, she sees it.
+        self.as_user(self.staff_a)
+        self.assertEqual(self.titles(lead=self.a_lead.pk), ['Old note'])
 
 
 class FollowUpAccessTests(FollowUpTestCase):
@@ -177,43 +192,56 @@ class FollowUpAccessTests(FollowUpTestCase):
         self.assertEqual((row['lead_name'], row['assigned_to_name'], row['can_edit'], row['can_delete'], row['can_open_lead']),
                          ('Pool Lead', 'Admin', True, True, True))
 
-    def test_staff_see_follow_ups_on_their_leads_and_those_assigned_to_them_only(self):
+    def test_staff_see_and_complete_only_the_follow_ups_assigned_to_them_whoever_the_lead_belongs_to(self):
         self.as_user(self.staff_a)
         self.assertEqual(sorted(self.titles()), ['Call Asha', 'Send brochure', 'Site visit with Asha'])
-        row = next(r for r in self.page()['results'] if r['id'] == self.b_for_a.pk)
-        # Staff A does it, so can complete and edit it, but the lead is Staff B's: no opening or deleting it.
-        self.assertEqual((row['can_edit'], row['can_delete'], row['can_open_lead']), (True, False, False))
-        self.assertEqual(self.patch(self.b_for_a.pk, status='COMPLETED').status_code, status.HTTP_200_OK)
-        self.assertEqual(self.patch(self.b_for_a.pk, description='Done with the team.').status_code, 200)
-        self.assertEqual(self.client.delete(reverse('activity-detail', args=[self.b_for_a.pk])).status_code, 404)
+        rows = {row['id']: row for row in self.page()['results']}
+        # Staff A does it, so completes it; editing and deleting are an admin's, and the lead is Staff B's: no opening it.
+        row = rows[self.b_for_a.pk]
+        self.assertEqual(
+            (row['can_edit'], row['can_delete'], row['can_open_lead'], row['can_update_status']), (False, False, False, True),
+        )
+        self.assertTrue(rows[self.on_a.pk]['can_open_lead'])  # her own lead, which the Leads module opens
+        self.assertEqual(self.complete(self.b_for_a.pk).status_code, status.HTTP_200_OK)
+        self.assertEqual(self.patch(self.b_for_a.pk, description='Done with the team.').status_code, 403)
+        self.assertEqual(self.client.delete(reverse('activity-detail', args=[self.b_for_a.pk])).status_code, 403)
         self.assertEqual(self.client.get(reverse('lead-detail', args=[self.b_lead.pk])).status_code, 404)
-        # Staff B's own follow-up and the unassigned lead's stay out of reach, whatever is asked for.
+        # Staff B's own follow-up and the admin's stay out of reach, whatever is asked for.
         for other in (self.on_b, self.on_pool):
-            self.assertEqual(self.patch(other.pk, status='COMPLETED').status_code, status.HTTP_404_NOT_FOUND)
-            self.assertEqual(self.client.delete(reverse('activity-detail', args=[other.pk])).status_code, 404)
+            for refused in (self.client.get(reverse('activity-detail', args=[other.pk])), self.complete(other.pk)):
+                self.assertEqual(
+                    (refused.status_code, refused.data['detail']), (403, 'You can only update activities assigned to you.'),
+                )
+            self.assertEqual(self.patch(other.pk, status='COMPLETED').status_code, status.HTTP_403_FORBIDDEN)
+            self.assertEqual(self.client.delete(reverse('activity-detail', args=[other.pk])).status_code, 403)
         self.assertEqual(self.page(assigned_to=self.staff_b.pk)['count'], 0)
         self.assertEqual(self.titles(lead=self.b_lead.pk), ['Site visit with Asha'])
         self.assertEqual(self.page(search='Proposal')['count'], 0)
         self.assertEqual(self.page(search='Pool')['count'], 0)
         # Staff B's lead matches her search only by what she's shown of it (name, phone, ID), never by its email or
-        # place; her own lead matches by those too.
+        # place; her own lead, which the Leads module lets her open, matches by those too.
         for shown in ('ravi', '98765 00002', f'#{self.b_lead.pk}'):
             self.assertEqual(self.titles(search=shown), ['Site visit with Asha'], shown)
         self.assertEqual(sorted(self.titles(search='ernakulam')), ['Call Asha', 'Send brochure'])
-        # Staff B, whose lead it is, sees both follow-ups on it, including the one Staff A does.
+        # Staff B, whose lead it is, sees only her own follow-up on it, not the one Staff A does.
         self.as_user(self.staff_b)
-        self.assertEqual(sorted(self.titles()), ['Proposal discussion', 'Site visit with Asha'])
+        self.assertEqual(self.titles(), ['Proposal discussion'])
         self.assertEqual(Activity.objects.get(pk=self.on_b.pk).status, ActivityStatus.PENDING)
+        self.assertEqual(Activity.objects.get(pk=self.on_pool.pk).status, ActivityStatus.PENDING)
 
-    def test_follow_ups_are_added_only_to_the_users_own_leads(self):
+    def test_follow_ups_are_added_by_admins_and_never_move_to_another_lead(self):
         self.as_user(self.staff_a)
-        refused = self.add(self.b_lead, assigned_to=self.staff_a.pk)
-        self.assertEqual(refused.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn('lead', refused.data)
+        for lead in (self.a_lead, self.b_lead):
+            self.assertEqual(self.add(lead, assigned_to=self.staff_a.pk).status_code, 403, lead.name)
+        self.assertEqual(self.patch(self.on_a.pk, lead=self.b_lead.pk).status_code, status.HTTP_403_FORBIDDEN)
+        self.as_user(self.admin)
         moved = self.patch(self.on_a.pk, lead=self.b_lead.pk)
         self.assertEqual(moved.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('lead', moved.data)
+        self.assertEqual(Activity.objects.get(pk=self.on_a.pk).lead, self.a_lead)
+        self.assertEqual(Activity.objects.count(), 5)
 
-    def test_reading_needs_view_writing_needs_change_and_the_page_needs_the_activities_module(self):
+    def test_the_page_and_completing_need_the_activities_module_and_a_leads_own_list_the_leads_module(self):
         role = Role.objects.get(name=Role.STAFF)
         role.permissions.remove(Permission.objects.get(content_type__app_label='accounts', codename='access_activities'))
         self.as_user(self.staff_a)
@@ -221,11 +249,18 @@ class FollowUpAccessTests(FollowUpTestCase):
         for blank in ('', ' '):
             self.assertEqual(self.client.get(reverse('activity-list'), {'lead': blank}).status_code, 403, repr(blank))
         self.assertEqual(self.client.get(f"{reverse('activity-list')}?lead={self.a_lead.pk}&lead=").status_code, 403)
-        self.assertEqual(self.page(lead=self.a_lead.pk)['count'], 2)
-        role.permissions.remove(Permission.objects.get(content_type__app_label='leads', codename='change_lead'))
+        self.assertEqual(self.client.get(reverse('activity-detail', args=[self.on_a.pk])).status_code, 403)
+        self.assertEqual(self.complete(self.on_a.pk).status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(Activity.objects.get(pk=self.on_a.pk).status, ActivityStatus.PENDING)
+        # A lead's own list (on its page) needs the Leads module only, and holds only her own follow-ups; completing them
+        # isn't offered.
+        self.assertEqual(
+            [(row['title'], row['can_update_status']) for row in self.page(lead=self.a_lead.pk)['results']],
+            [('Send brochure', False), ('Call Asha', False)],
+        )
+        role.permissions.remove(Permission.objects.get(content_type__app_label='leads', codename='view_lead'))
         self.as_user(self.staff_a)
-        self.assertEqual(self.patch(self.on_a.pk, status='COMPLETED').status_code, status.HTTP_403_FORBIDDEN)
-        self.assertEqual(self.add(self.a_lead, assigned_to=self.staff_a.pk).status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(self.client.get(reverse('activity-list'), {'lead': self.a_lead.pk}).status_code, 403)
         self.client.force_authenticate(None)
         self.assertEqual(self.client.get(reverse('activity-list')).status_code, status.HTTP_401_UNAUTHORIZED)
 
@@ -367,11 +402,13 @@ class LeadAndWorkActivitiesTests(FollowUpTestCase):
 
     def test_completing_a_follow_up_records_when_and_by_whom_and_it_stays_completed(self):
         self.as_user(self.staff_a)
-        done = self.patch(self.on_lead.pk, status='COMPLETED')
+        done = self.complete(self.on_lead.pk)
         self.assertEqual((done.status_code, done.data['completed_by_name']), (200, 'Staff A'))
         self.assertIsNotNone(done.data['completed_at'])
         stored = Activity.objects.get(pk=self.on_lead.pk)
         self.assertEqual((stored.status, stored.completed_by), (ActivityStatus.COMPLETED, self.staff_a))
+        self.assertEqual(self.complete(self.on_lead.pk).status_code, status.HTTP_400_BAD_REQUEST)
+        self.as_user(self.admin)
         self.assertEqual(self.patch(self.on_lead.pk, status='PENDING').status_code, status.HTTP_400_BAD_REQUEST)
 
     def test_each_list_holds_only_its_own_kind(self):
@@ -387,14 +424,18 @@ class LeadAndWorkActivitiesTests(FollowUpTestCase):
             (None, None, 'Won Lead', True, False, False),
         )
 
-    def test_staff_without_the_work_module_never_see_a_work_activity_even_one_assigned_to_them(self):
+    def test_staff_see_and_complete_their_own_work_activities_without_the_work_module(self):
         self.as_user(self.staff_a)
+        # The Lead Activities page holds lead follow-ups only; hers on a Work are on the Work Activities page.
         self.assertEqual(self.titles(), ['Call Asha'])
-        url = reverse('activity-detail', args=[self.on_work.pk])
-        self.assertEqual(self.client.get(url).status_code, status.HTTP_404_NOT_FOUND)
-        self.assertEqual(self.patch(self.on_work.pk, status='COMPLETED').status_code, status.HTTP_404_NOT_FOUND)
+        works = self.client.get(reverse('activity-works'))
+        self.assertEqual([row['description'] for row in works.data['results']], ['Roof survey.'])
+        self.assertEqual(self.client.get(reverse('activity-detail', args=[self.on_work.pk])).status_code, 200)
+        self.assertEqual(self.complete(self.on_work.pk).status_code, status.HTTP_200_OK)
+        self.assertEqual(Activity.objects.get(pk=self.on_work.pk).status, ActivityStatus.COMPLETED)
+        # The Work itself, and its own list of activities (on its page), are for the Work module.
         self.assertEqual(self.client.get(reverse('activity-list'), {'work': self.work.pk}).status_code, 403)
-        self.assertEqual(Activity.objects.get(pk=self.on_work.pk).status, ActivityStatus.PENDING)
+        self.assertEqual(self.client.get(reverse('work-detail', args=[self.work.pk])).status_code, 403)
 
     def test_a_work_activity_follows_the_work_rules_not_the_follow_up_rules(self):
         self.as_user(self.admin)
@@ -413,8 +454,8 @@ class LeadAndWorkActivitiesTests(FollowUpTestCase):
 
 
 class ActivityOrderAndStatusRuleTests(FollowUpTestCase):
-    """On the Activities pages a staff member's own activities come first; only the assignee or an admin changes an
-    activity's status."""
+    """On the Activities pages staff see only their own activities, in the order asked for; only the assignee or an
+    admin completes an activity, and only an admin edits, reassigns or reopens one."""
 
     @classmethod
     def setUpTestData(cls):
@@ -437,87 +478,95 @@ class ActivityOrderAndStatusRuleTests(FollowUpTestCase):
         cls.work_for_b = Activity.objects.create(work=cls.work, type='NOTE', description='For B.', assigned_to=cls.staff_b, created_by=cls.admin)
         cls.work_for_a = Activity.objects.create(work=cls.work, type='NOTE', description='For A.', assigned_to=cls.staff_a, created_by=cls.admin)
 
-    def test_staff_see_their_own_follow_ups_first_then_other_peoples_then_unassigned_ones(self):
+    def test_staff_see_only_their_own_follow_ups_in_the_order_asked_for(self):
         self.as_user(self.staff_a)
-        # Mine (newest first), others' (newest first), unassigned.
-        self.assertEqual(self.titles(), ['Visit with Asha', 'Call Asha', 'Survey by B', 'Legacy note'])
-        # The chosen order holds within each group.
-        self.assertEqual(self.titles(ordering='due_date'), ['Visit with Asha', 'Call Asha', 'Survey by B', 'Legacy note'])
-        self.assertEqual(self.titles(ordering='-due_date'), ['Call Asha', 'Visit with Asha', 'Survey by B', 'Legacy note'])
-        # One lead's follow-ups keep the order asked for alone (the lead's page lists pending first, then newest).
-        self.assertEqual(self.titles(lead=self.a_lead.pk, ordering='-due_date'), ['Call Asha', 'Survey by B', 'Legacy note'])
+        # Hers alone (newest first): never another person's or an unassigned one, even on her own lead.
+        self.assertEqual(self.titles(), ['Visit with Asha', 'Call Asha'])
+        self.assertEqual(self.titles(ordering='due_date'), ['Visit with Asha', 'Call Asha'])
+        self.assertEqual(self.titles(ordering='-due_date'), ['Call Asha', 'Visit with Asha'])
+        # One lead's follow-ups too.
+        self.assertEqual(self.titles(lead=self.a_lead.pk, ordering='-due_date'), ['Call Asha'])
+        self.as_user(self.staff_b)
+        self.assertEqual(self.titles(), ['Proposal', 'Survey by B'])
         # An admin's page is everyone's work in the chosen order.
         self.as_user(self.admin)
         self.assertEqual(self.titles(), ['Visit with Asha', 'Proposal', 'Call Asha', 'Survey by B', 'Legacy note'])
 
-    def test_staff_see_their_own_work_activities_first_on_the_work_activities_page(self):
+    def test_staff_see_only_their_own_work_activities_on_the_work_activities_page(self):
         def descriptions():
             response = self.client.get(reverse('activity-works'))
             self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
             return [row['description'] for row in response.data['results']]
 
         self.as_user(self.staff_a)
-        self.assertEqual(descriptions(), ['For A.', 'For B.', 'Unassigned.'])
+        self.assertEqual(descriptions(), ['For A.'])
         self.as_user(self.staff_b)
-        self.assertEqual(descriptions(), ['For B.', 'For A.', 'Unassigned.'])
+        self.assertEqual(descriptions(), ['For B.'])
         self.as_user(self.admin)
         self.assertEqual(descriptions(), ['For A.', 'For B.', 'Unassigned.'])  # the Work's own order: newest first
 
-    def test_only_the_assignee_or_an_admin_changes_a_follow_ups_status(self):
-        # Staff A works the lead, so can edit B's follow-up on it, but not complete it.
+    def test_only_the_assignee_or_an_admin_completes_a_follow_up_and_only_an_admin_edits_one(self):
+        # Staff B's follow-up on Staff A's lead isn't on Staff A's list, and opening or completing it is refused.
         self.as_user(self.staff_a)
-        row = next(r for r in self.page()['results'] if r['id'] == self.a_by_b.pk)
-        self.assertEqual((row['can_edit'], row['can_update_status']), (True, False))
-        refused = self.patch(self.a_by_b.pk, status='COMPLETED')
-        self.assertEqual(refused.status_code, status.HTTP_403_FORBIDDEN)
-        self.assertEqual(refused.data['detail'], 'You can only update activities assigned to you.')
-        self.assertEqual(Activity.objects.get(pk=self.a_by_b.pk).status, ActivityStatus.PENDING)
-        # Taking it over and completing it in one request is refused too, and nothing of it is saved; so is taking it
-        # over first (to complete it next): someone else's activity is reassigned by an admin only.
-        hijack = self.patch(self.a_by_b.pk, assigned_to=self.staff_a.pk, status='COMPLETED')
-        self.assertEqual(hijack.status_code, status.HTTP_403_FORBIDDEN)
-        takeover = self.patch(self.a_by_b.pk, assigned_to=self.staff_a.pk)
-        self.assertEqual(takeover.status_code, status.HTTP_403_FORBIDDEN)
-        self.assertEqual(takeover.data['detail'], 'Only an admin can reassign an activity assigned to someone else.')
-        self.assertEqual(Activity.objects.get(pk=self.a_by_b.pk).assigned_to, self.staff_b)
-        self.assertEqual(self.patch(self.a_by_b.pk, title='Survey by B (roof)', assigned_to=self.staff_b.pk).status_code, 200)
-        self.assertEqual(self.patch(self.a_by_b.pk, title='Survey by B (roof)').status_code, status.HTTP_200_OK)
-        # An unassigned one may be taken; an admin reassigns anything.
-        self.assertEqual(self.patch(self.unassigned_on_a.pk, assigned_to=self.staff_a.pk).status_code, status.HTTP_200_OK)
+        self.assertNotIn(self.a_by_b.pk, [row['id'] for row in self.page()['results']])
+        for refused in (self.client.get(reverse('activity-detail', args=[self.a_by_b.pk])), self.complete(self.a_by_b.pk)):
+            self.assertEqual((refused.status_code, refused.data['detail']), (403, 'You can only update activities assigned to you.'))
+        # So is completing it by editing it, taking it over (to complete it next), or both in one request; nor can an
+        # unassigned one be taken, or her own be edited. Nothing of it is saved.
+        for activity, body in [
+            (self.a_by_b, {'status': 'COMPLETED'}), (self.a_by_b, {'assigned_to': self.staff_a.pk}),
+            (self.a_by_b, {'assigned_to': self.staff_a.pk, 'status': 'COMPLETED'}), (self.a_by_b, {'title': 'Survey (roof)'}),
+            (self.unassigned_on_a, {'assigned_to': self.staff_a.pk}), (self.on_a, {'title': 'Call Asha (edited)'}),
+        ]:
+            self.assertEqual(self.patch(activity.pk, **body).status_code, status.HTTP_403_FORBIDDEN, (activity.title, body))
+        a_by_b = Activity.objects.get(pk=self.a_by_b.pk)
+        self.assertEqual((a_by_b.title, a_by_b.assigned_to, a_by_b.status), ('Survey by B', self.staff_b, ActivityStatus.PENDING))
+        self.assertIsNone(Activity.objects.get(pk=self.unassigned_on_a.pk).assigned_to)
+        self.assertEqual(Activity.objects.get(pk=self.on_a.pk).title, 'Call Asha')
+        # An admin reassigns anything.
         self.as_user(self.admin)
         self.assertEqual(self.patch(self.a_by_b.pk, assigned_to=self.staff_a.pk).status_code, status.HTTP_200_OK)
         self.assertEqual(self.patch(self.a_by_b.pk, assigned_to=self.staff_b.pk).status_code, status.HTTP_200_OK)
+        # Her own she completes, with the complete action.
         self.as_user(self.staff_a)
-        # Their own, and one assigned to no one, they complete.
         mine = next(r for r in self.page()['results'] if r['id'] == self.on_a.pk)
-        self.assertTrue(mine['can_update_status'])
-        self.assertEqual(self.patch(self.on_a.pk, status='COMPLETED').status_code, status.HTTP_200_OK)
-        self.assertEqual(self.patch(self.unassigned_on_a.pk, status='COMPLETED').status_code, status.HTTP_200_OK)
-        # The assignee completes it; so does an admin.
+        self.assertEqual((mine['can_edit'], mine['can_update_status']), (False, True))
+        self.assertEqual(self.complete(self.on_a.pk).status_code, status.HTTP_200_OK)
+        # The assignee completes it; so does an admin, even one assigned to no one.
         self.as_user(self.staff_b)
-        self.assertEqual(self.patch(self.a_by_b.pk, status='COMPLETED').status_code, status.HTTP_200_OK)
+        self.assertEqual(self.complete(self.a_by_b.pk).status_code, status.HTTP_200_OK)
         self.as_user(self.admin)
         self.assertEqual(self.patch(self.on_b.pk, status='COMPLETED').status_code, status.HTTP_200_OK)
+        self.assertEqual(self.complete(self.unassigned_on_a.pk).status_code, status.HTTP_200_OK)
         self.assertEqual(Notification.objects.filter(kind='ACTIVITY_STATUS', recipient=self.staff_b).count(), 1)
 
-    def test_the_same_status_rule_holds_for_work_activities(self):
+    def test_the_same_rules_hold_for_work_activities(self):
         self.as_user(self.staff_a)
+        # A Work's own list (with the Work module) holds only hers too.
         rows = {row['id']: row for row in self.client.get(reverse('activity-list'), {'work': self.work.pk}).data['results']}
+        self.assertEqual(list(rows), [self.work_for_a.pk])
+        self.assertEqual((rows[self.work_for_a.pk]['can_edit'], rows[self.work_for_a.pk]['can_update_status']), (False, True))
+        for other in (self.work_for_b, self.work_unassigned):
+            refused = self.complete(other.pk)
+            self.assertEqual((refused.status_code, refused.data['detail']), (403, 'You can only update activities assigned to you.'))
+            # Taking it, editing it or completing it by editing it: an admin's.
+            for body in ({'assigned_to': self.staff_a.pk}, {'description': 'Edited.'}, {'status': 'COMPLETED'}):
+                self.assertEqual(self.patch(other.pk, **body).status_code, status.HTTP_403_FORBIDDEN, body)
+        # Releasing her own is an admin's too.
+        self.assertEqual(self.patch(self.work_for_a.pk, assigned_to=None).status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(self.complete(self.work_for_a.pk).status_code, status.HTTP_200_OK)
+        # Reopening is an admin's, even for its assignee.
+        self.assertEqual(self.patch(self.work_for_a.pk, status='PENDING').status_code, status.HTTP_403_FORBIDDEN)
         self.assertEqual(
-            [rows[a.pk]['can_update_status'] for a in (self.work_for_a, self.work_for_b, self.work_unassigned)], [True, False, True],
+            list(Activity.objects.filter(work=self.work).order_by('pk').values_list('description', 'assigned_to', 'status')),
+            [('Unassigned.', None, 'PENDING'), ('For B.', self.staff_b.pk, 'PENDING'), ('For A.', self.staff_a.pk, 'COMPLETED')],
         )
-        refused = self.patch(self.work_for_b.pk, status='COMPLETED')
-        self.assertEqual((refused.status_code, refused.data['detail']), (403, 'You can only update activities assigned to you.'))
-        self.assertEqual(self.patch(self.work_for_b.pk, assigned_to=self.staff_a.pk).status_code, status.HTTP_403_FORBIDDEN)
-        self.assertEqual(self.patch(self.work_unassigned.pk, assigned_to=self.staff_a.pk).status_code, status.HTTP_200_OK)
-        self.assertEqual(self.patch(self.work_unassigned.pk, assigned_to=None).status_code, status.HTTP_200_OK)  # own: may be released
-        self.assertEqual(self.patch(self.work_for_b.pk, description='For B, edited.').status_code, status.HTTP_200_OK)
-        self.assertEqual(self.patch(self.work_for_a.pk, status='COMPLETED').status_code, status.HTTP_200_OK)
-        self.assertEqual(self.patch(self.work_unassigned.pk, status='COMPLETED').status_code, status.HTTP_200_OK)
-        # The edit dialog sends the status along unchanged: that is no status change, so it is allowed.
-        self.assertEqual(self.patch(self.work_for_b.pk, status='PENDING', description='For B, edited again.').status_code, 200)
         self.as_user(self.staff_b)
-        self.assertEqual(self.patch(self.work_for_b.pk, status='COMPLETED').status_code, status.HTTP_200_OK)
-        self.assertEqual(self.patch(self.work_for_b.pk, status='PENDING').status_code, status.HTTP_200_OK)  # reopened by its assignee
+        self.assertEqual(self.complete(self.work_for_b.pk).status_code, status.HTTP_200_OK)
         self.as_user(self.admin)
+        # The edit dialog sends the status along unchanged: that is no status change.
+        self.assertEqual(self.patch(self.work_for_b.pk, status='COMPLETED', description='For B, edited.').status_code, 200)
+        self.assertEqual(self.patch(self.work_for_b.pk, status='PENDING').status_code, status.HTTP_200_OK)  # reopened
+        self.assertEqual(self.patch(self.work_unassigned.pk, assigned_to=self.staff_a.pk).status_code, status.HTTP_200_OK)
+        self.assertEqual(self.patch(self.work_unassigned.pk, assigned_to=None).status_code, status.HTTP_200_OK)
         self.assertEqual(self.patch(self.work_for_b.pk, status='COMPLETED').status_code, status.HTTP_200_OK)

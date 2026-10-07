@@ -59,6 +59,11 @@ class RoleSerializer(serializers.ModelSerializer):
         # ADMIN holds every permission through User.has_perm, so an admin can never be locked out of Settings.
         if self.instance.pk == Role.ADMIN and 'modules' in attrs:
             raise serializers.ValidationError({'modules': "Admins always have every module, so their access can't change."})
+        # Staff work only on the activities assigned to them: Activities is the one module they can be given, and Leads,
+        # Work, Dashboard, Reports and Settings stay with admins.
+        granted = {permission_name(permission) for permission in attrs.get('modules', [])}
+        if not granted <= set(MODULES['activities']['permissions']):
+            raise serializers.ValidationError({'modules': 'Staff can only be given the Activities module.'})
         return attrs
 
     def update(self, role, validated_data):

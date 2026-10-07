@@ -386,9 +386,7 @@ class LeadApiTests(APITestCase):
         self.client.force_authenticate(grant(self.staff, 'view_lead'))
         self.assertEqual(self.client.get(reverse('lead-assignees')).data, [{'id': self.staff.pk, 'name': 'Staff'}])
 
-    def test_plans_list_every_plan_with_its_current_price_for_any_signed_in_user(self):
-        self.client.force_authenticate(self.staff)
-
+    def test_plans_list_every_plan_with_its_current_price_for_the_leads_and_work_modules(self):
         response = self.client.get(reverse('plan-list'))
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
@@ -399,6 +397,18 @@ class LeadApiTests(APITestCase):
                 ('8 kW', '245000.00', True), ('10 kW', '289000.00', True),
             ],
         )
+        # Staff need the Leads or the Work module: no module, or Activities alone, isn't enough.
+        role = Role.objects.get(name=Role.STAFF)
+        self.client.force_authenticate(self.staff)
+        self.assertEqual(self.client.get(reverse('plan-list')).status_code, status.HTTP_403_FORBIDDEN)
+        role.permissions.add(Permission.objects.get(codename='access_activities'))
+        self.client.force_authenticate(User.objects.get(pk=self.staff.pk))
+        self.assertEqual(self.client.get(reverse('plan-list')).status_code, status.HTTP_403_FORBIDDEN)
+        self.client.force_authenticate(grant(self.staff, 'view_lead'))
+        self.assertEqual(self.client.get(reverse('plan-list')).status_code, status.HTTP_200_OK)
+        role.permissions.set([Permission.objects.get(codename='access_work')])
+        self.client.force_authenticate(User.objects.get(pk=self.staff.pk))
+        self.assertEqual(self.client.get(reverse('plan-list')).status_code, status.HTTP_200_OK)
 
 
 class LeadAccessTests(APITestCase):

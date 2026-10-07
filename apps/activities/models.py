@@ -1,6 +1,5 @@
 from django.conf import settings
 from django.db import models
-from django.db.models import Q
 
 from apps.accounts.models import Role
 
@@ -20,13 +19,9 @@ class ActivityStatus(models.TextChoices):
 
 class ActivityQuerySet(models.QuerySet):
     def visible_to(self, user):
-        """A lead's follow-ups a user works with: every one for an admin; for staff, those on the leads assigned to them
-        and those assigned to them on other leads (whoever has to do a follow-up can see it). Work activities aren't
-        among them: they follow the Work module (the activities API adds them for users who have it)."""
-        follow_ups = self.filter(lead__isnull=False)
-        if user.role_id == Role.ADMIN:
-            return follow_ups
-        return follow_ups.filter(Q(lead__assigned_to=user) | Q(assigned_to=user))
+        """The activities a user sees: every one for an admin; for staff only those assigned to them, on any lead or
+        Work. Never another staff member's, an admin's or an unassigned one, whoever the lead or Work belongs to."""
+        return self if user.role_id == Role.ADMIN else self.filter(assigned_to=user)
 
 
 class Activity(models.Model):
@@ -67,6 +62,9 @@ class Activity(models.Model):
         blank=True,
         related_name='completed_activities',
     )
+    # What was done, as whoever completed it noted it: optional, and cleared if a Work's activity is reopened. The
+    # task's own notes stay in description.
+    completion_note = models.TextField(blank=True)
     created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name='activities')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -103,7 +101,7 @@ class Activity(models.Model):
         return self.title or f'{self.get_type_display()}: {self.lead or self.work}'
 
     def status_changeable_by(self, user):
-        """Whether `user` may complete or reopen this activity, on top of being allowed to edit it at all: an admin, the
-        staff member it is assigned to, or (for an activity assigned to no one) anyone who can edit it. Another staff
-        member can see it but never changes its status."""
-        return user.role_id == Role.ADMIN or self.assigned_to_id is None or self.assigned_to_id == user.pk
+        """Whether `user` may open and complete this activity: an admin, or the staff member it is assigned to. Never
+        another staff member, and no staff member for an activity assigned to no one (it can't be taken over first:
+        editing and reassigning are for admins)."""
+        return user.role_id == Role.ADMIN or self.assigned_to_id == user.pk
