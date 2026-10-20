@@ -1,18 +1,17 @@
 import re
 from decimal import Decimal
 
-from django.contrib.auth import get_user_model
 from django.db import transaction
 from rest_framework import serializers
 
 from apps.accounts.models import Role
+from apps.accounts.serializers import AssigneesSerializer
 from apps.activities.models import Activity, ActivityStatus
 from apps.activities.serializers import FollowUpSerializer
 
 from .models import Lead, LeadSource, LeadStatus, SolarPlan
 
-User = get_user_model()
-
+# assigned_to__name: by the first assignee's name (see filter_leads).
 ORDERINGS = ['name', 'created_at', 'status', 'amount', 'next_follow_up', 'plan__capacity', 'assigned_to__name']
 
 
@@ -22,20 +21,20 @@ class SolarPlanSerializer(serializers.ModelSerializer):
         fields = ['id', 'name', 'capacity', 'amount', 'is_active']
 
 
-class LeadSerializer(serializers.ModelSerializer):
+class LeadSerializer(AssigneesSerializer, serializers.ModelSerializer):
+    """A lead. Only the name and phone number are required. The plan is optional; once a lead has a plan, an amount left
+    out (or null) is the plan's current price, from the database. The assignees are any number of active users (see
+    AssigneesSerializer); staff can't change them."""
+
     # Declared here so spaces, hyphens and a leading 0 are removed before the digits-only check.
     phone = serializers.CharField(max_length=20)
-    plan = serializers.PrimaryKeyRelatedField(queryset=SolarPlan.objects.all(), pk_field=serializers.IntegerField())
-    # Optional on create: a new lead without an amount gets its plan's current price.
-    amount = serializers.DecimalField(max_digits=12, decimal_places=2, min_value=Decimal('0'), required=False)
-    assigned_to = serializers.PrimaryKeyRelatedField(
-        queryset=User.objects.all(),
-        pk_field=serializers.IntegerField(),
-        required=False,
-        allow_null=True,
+    plan = serializers.PrimaryKeyRelatedField(
+        queryset=SolarPlan.objects.all(), pk_field=serializers.IntegerField(), required=False, allow_null=True,
+    )
+    amount = serializers.DecimalField(
+        max_digits=12, decimal_places=2, min_value=Decimal('0'), required=False, allow_null=True,
     )
     plan_name = serializers.SerializerMethodField()
-    assigned_to_name = serializers.SerializerMethodField()
     created_by_name = serializers.SerializerMethodField()
     allowed_transitions = serializers.SerializerMethodField()
     # The Work created by converting the lead; null until it is converted.
@@ -52,9 +51,9 @@ class LeadSerializer(serializers.ModelSerializer):
     class Meta:
         model = Lead
         fields = [
-            'id', 'name', 'country_code', 'phone', 'email', 'state', 'district', 'area', 'pin_code',
+            'id', 'name', 'country_code', 'phone', 'email', 'state', 'district', 'area', 'pin_code', 'dealer_name',
             'plan', 'plan_name', 'amount', 'status', 'allowed_transitions', 'source',
-            'assigned_to', 'assigned_to_name', 'next_follow_up', 'notes', 'is_pinned', 'work',
+            'assignee_ids', 'assignees', 'assigned_to', 'assigned_to_name', 'next_follow_up', 'notes', 'is_pinned', 'work',
             'can_edit', 'can_delete', 'can_assign', 'can_convert', 'created_by_name', 'created_at', 'updated_at',
             'initial_follow_up',
         ]
@@ -62,10 +61,7 @@ class LeadSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'status', 'created_at', 'updated_at']
 
     def get_plan_name(self, lead):
-        return lead.plan.name
-
-    def get_assigned_to_name(self, lead):
-        return lead.assigned_to.name if lead.assigned_to else None
+        return lead.plan.name if lead.plan else None
 
     def get_created_by_name(self, lead):
         return lead.created_by.name
@@ -86,7 +82,7 @@ class LeadSerializer(serializers.ModelSerializer):
 
     def validate_plan(self, plan):
         # An inactive plan may stay on a lead that already has it, but can't be newly chosen.
-        if not plan.is_active and plan != getattr(self.instance, 'plan', None):
+        if plan and not plan.is_active and plan != getattr(self.instance, 'plan', None):
             raise serializers.ValidationError('Select an active plan.')
         return plan
 
@@ -100,23 +96,30 @@ class LeadSerializer(serializers.ModelSerializer):
         return self.context['request'].user.role_id == Role.ADMIN
 
     def get_can_convert(self, lead):
-        # Converting needs a Won lead without its Work yet (convert() checks both) and someone who can change it.
-        return lead.status == LeadStatus.WON and getattr(lead, 'work', None) is None and self.get_can_edit(lead)
-
-    def validate_assigned_to(self, user):
-        current = getattr(self.instance, 'assigned_to', None)
-        requester = self.context['request'].user
-        if requester.role_id != Role.ADMIN:
-            # Staff can't hand a lead to someone else: a new lead is theirs, an existing one keeps its assignee.
-            keep = current if self.instance else requester
-            if user != keep and not (self.instance is None and user is None):
-                raise serializers.ValidationError('Only an admin can assign a lead to someone else.')
-            return keep
-        if user and not user.is_active and user != current:
-            raise serializers.ValidationError('Select an active user.')
-        return user
+        # Converting needs a Won lead without its Work yet, with a plan and an amount (convert() checks them all), and
+        # someone who can change it.
+        return (
+            lead.status == LeadStatus.WON and getattr(lead, 'work', None) is None
+            and lead.plan_id is not None and lead.amount is not None and self.get_can_edit(lead)
+        )
 
     def validate(self, attrs):
+        attrs = super().validate(attrs)
+        requester = self.context['request'].user
+        if 'assignees' in attrs and requester.role_id != Role.ADMIN:
+            # Staff can't hand a lead to someone else: a new lead is theirs (the view assigns it to them), an existing
+            # one keeps its assignees.
+            keep = self.current_assignees() if self.instance else {requester}
+            chosen = set(attrs['assignees'])
+            if chosen != keep and not (self.instance is None and not chosen):
+                raise serializers.ValidationError({self.assignees_field: 'Only an admin can assign a lead to someone else.'})
+        if refused := self.check_assignees(attrs, staff_may_add=[requester]):
+            raise serializers.ValidationError({self.assignees_field: refused})
+        # A lead with a plan always has an amount: left out, it is the plan's current price (never one made up here).
+        plan = attrs['plan'] if 'plan' in attrs else getattr(self.instance, 'plan', None)
+        amount = attrs['amount'] if 'amount' in attrs else getattr(self.instance, 'amount', None)
+        if plan is not None and amount is None:
+            attrs['amount'] = plan.amount
         if 'phone' in attrs or 'country_code' in attrs:
             country_code = attrs.get('country_code', getattr(self.instance, 'country_code', '91'))
             phone = attrs.get('phone', getattr(self.instance, 'phone', ''))
@@ -134,12 +137,15 @@ class LeadSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         follow_up = validated_data.pop('initial_follow_up', None)
-        validated_data.setdefault('amount', validated_data['plan'].amount)
         # Both or neither: a lead is never left without the follow-up it was added with, nor a follow-up without its lead.
         with transaction.atomic():
             lead = super().create(validated_data)
             if follow_up:
-                Activity.objects.create(lead=lead, created_by=lead.created_by, status=ActivityStatus.PENDING, **follow_up)
+                assignees = follow_up.pop('assignees')
+                activity = Activity.objects.create(
+                    lead=lead, created_by=lead.created_by, status=ActivityStatus.PENDING, **follow_up,
+                )
+                activity.assignees.set(assignees)
         return lead
 
 

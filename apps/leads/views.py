@@ -3,7 +3,7 @@ from decimal import Decimal
 
 from django.contrib.auth import get_user_model
 from django.db import transaction
-from django.db.models import Case, Count, F, IntegerField, ProtectedError, Sum, Value, When
+from django.db.models import Case, Count, F, IntegerField, OuterRef, ProtectedError, Subquery, Sum, Value, When
 from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework import mixins, status, viewsets
@@ -13,7 +13,7 @@ from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import BasePermission
 from rest_framework.response import Response
 
-from apps.accounts.models import Role
+from apps.accounts.models import Role, by_name
 from apps.accounts.permissions import IsAdminRole, ModelPermissions
 from apps.notifications import services as notifications
 
@@ -59,6 +59,10 @@ STATUS_RANK = Case(
     *(When(status=value, then=Value(rank)) for rank, value in enumerate(LeadStatus.values)),
     output_field=IntegerField(),
 )
+# Sorting by assignee: by the first one's name, as a subquery, so a lead with several assignees is still one row.
+FIRST_ASSIGNEE_NAME = Subquery(
+    User.objects.filter(assigned_leads=OuterRef('pk')).order_by('name', 'pk').values('name')[:1],
+)
 
 
 def filter_leads(leads, query_params):
@@ -73,8 +77,9 @@ def filter_leads(leads, query_params):
             leads = leads.filter(**{field: params[field]})
     if 'plan' in params:
         leads = leads.filter(plan_id=params['plan'])
+    # The leads this user is one of the assignees of (one row per lead).
     if 'assigned_to' in params:
-        leads = leads.filter(assigned_to_id=params['assigned_to'])
+        leads = leads.filter(assignees=params['assigned_to'])
     # Calendar days in the CRM's time zone (Asia/Kolkata), both ends included.
     if 'created_after' in params:
         leads = leads.filter(created_at__date__gte=params['created_after'])
@@ -82,7 +87,10 @@ def filter_leads(leads, query_params):
         leads = leads.filter(created_at__date__lte=params['created_before'])
 
     ordering = params.get('ordering', '-created_at')
-    field = F('status_rank' if ordering.lstrip('-') == 'status' else ordering.lstrip('-'))
+    key = ordering.lstrip('-')
+    if key == 'assigned_to__name':
+        leads = leads.annotate(first_assignee_name=FIRST_ASSIGNEE_NAME)
+    field = F({'status': 'status_rank', 'assigned_to__name': 'first_assignee_name'}.get(key, key))
     order = field.desc(nulls_last=True) if ordering.startswith('-') else field.asc(nulls_last=True)
     # Pinned leads come first; the id keeps pages stable when many leads share the sorted value.
     return leads.annotate(status_rank=STATUS_RANK).order_by('-is_pinned', order, '-id')
@@ -139,7 +147,10 @@ class LeadViewSet(
     lookup_value_regex = '[0-9]+'
 
     def get_queryset(self):
-        leads = Lead.objects.visible_to(self.request.user).select_related('plan', 'assigned_to', 'created_by', 'work')
+        leads = (
+            Lead.objects.visible_to(self.request.user).select_related('plan', 'created_by', 'work')
+            .prefetch_related('assignees')
+        )
         if self.action in ('list', 'export', 'summary'):
             return filter_leads(leads, self.request.query_params)
         return leads
@@ -176,11 +187,11 @@ class LeadViewSet(
     def perform_create(self, serializer):
         user = self.request.user
         # A lead staff add is theirs: assigned to them, so it stays in their list. Admins assign anyone.
-        extra = {} if user.role_id == Role.ADMIN else {'assigned_to': user}
+        extra = {} if user.role_id == Role.ADMIN else {'assignees': [user]}
         lead = serializer.save(created_by=user, **extra)
         notifications.lead_created(lead, user)
-        # The initial follow-up added with the lead, if any, has its own assignee.
-        for follow_up in lead.activities.select_related('assigned_to', 'lead'):
+        # The initial follow-up added with the lead, if any, has its own assignees.
+        for follow_up in lead.activities.select_related('lead').prefetch_related('assignees'):
             notifications.activity_assigned(follow_up, user)
 
     def destroy(self, request, *args, **kwargs):
@@ -238,13 +249,14 @@ class LeadViewSet(
         writer = csv.writer(response)
         writer.writerow([
             'Lead ID', 'Customer', 'Country code', 'Phone', 'Email', 'Area', 'District', 'State', 'PIN code',
-            'Plan', 'Amount', 'Status', 'Source', 'Assigned to', 'Next follow-up', 'Created',
+            'Dealer', 'Plan', 'Amount', 'Status', 'Source', 'Assigned to', 'Next follow-up', 'Created',
         ])
         for lead in self.get_queryset():
             writer.writerow([csv_cell(value) for value in (
                 lead.id, lead.name, lead.country_code, lead.phone, lead.email, lead.area, lead.district, lead.state,
-                lead.pin_code, lead.plan.name, lead.amount, lead.get_status_display(), lead.get_source_display(),
-                lead.assigned_to.name if lead.assigned_to else '', lead.next_follow_up or '',
+                lead.pin_code, lead.dealer_name, lead.plan.name if lead.plan else '', '' if lead.amount is None else lead.amount,
+                lead.get_status_display(), lead.get_source_display(),
+                ', '.join(user.name for user in by_name(lead.assignees.all())), lead.next_follow_up or '',
                 timezone.localtime(lead.created_at).strftime('%Y-%m-%d %H:%M'),
             )])
         return response

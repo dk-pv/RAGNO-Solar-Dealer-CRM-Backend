@@ -1,13 +1,14 @@
 """What the CRM notifies people about, called from the views that make the change (each inside the request's transaction,
 so a notification is never left behind by a change that was rolled back).
 
-- A staff member or admin is told when an activity is assigned to them, and when one of theirs is completed or reopened
-  by someone else.
+- A staff member or admin is told when an activity is assigned to them (alone or with others), and when one of theirs is
+  completed or reopened by someone else.
 - Admins are told when a lead is added, a lead is converted to its Work, a Work is completed, an activity is completed or
   reopened, and the CRM's data is reset.
 
 Whoever made the change is never told about it (they know), so an admin working alone gets no notifications of their own
-doing. An assignment that doesn't change sends nothing: the views call activity_assigned() only when the assignee changes.
+doing. Each person gets one notification per event, even if they are both an admin and an assignee. An assignment that
+doesn't change sends nothing: on an edit, the views tell only the people newly added.
 """
 
 from django.contrib.auth import get_user_model
@@ -45,21 +46,22 @@ def _about(activity):
     return f'{subject} for {customer}'
 
 
-def activity_assigned(activity, actor):
-    """The assignee is told, unless they assigned it to themselves."""
-    if activity.assigned_to is None or activity.assigned_to == actor:
+def activity_assigned(activity, actor, users=None):
+    """The assignees (`users`: the ones just added; all of them by default) are told, except whoever assigned it."""
+    recipients = [user for user in (activity.assignees.all() if users is None else users) if user != actor]
+    if not recipients:
         return
     send(
-        [activity.assigned_to], NotificationKind.ACTIVITY_ASSIGNED, 'New activity assigned to you',
+        recipients, NotificationKind.ACTIVITY_ASSIGNED, 'New activity assigned to you',
         f'{_about(activity)} is assigned to you.', lead=activity.lead, work=activity.work, activity=activity,
     )
 
 
 def activity_status_changed(activity, actor):
-    """Admins and the assignee are told that it was completed (or, a Work's activity, reopened)."""
+    """Admins and the assignees are told that it was completed (or, a Work's activity, reopened)."""
     completed = activity.status == ActivityStatus.COMPLETED
     send(
-        [*admins(exclude=actor), activity.assigned_to if activity.assigned_to != actor else None],
+        [*admins(exclude=actor), *(user for user in activity.assignees.all() if user != actor)],
         NotificationKind.ACTIVITY_STATUS, 'Activity completed' if completed else 'Activity reopened',
         f'{actor.name} marked {_about(activity)} as {"completed" if completed else "pending"}.',
         lead=activity.lead, work=activity.work, activity=activity,

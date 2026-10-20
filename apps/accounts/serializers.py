@@ -4,7 +4,7 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db.models import Q
 from rest_framework import serializers
 
-from .models import Department, Role, User
+from .models import Department, Role, User, by_name
 from .permissions import MODULES
 
 
@@ -152,6 +152,75 @@ class UserSerializer(serializers.ModelSerializer):
             # A createsuperuser account would otherwise keep every permission through is_superuser.
             instance.is_superuser = instance.is_staff = False
         return super().update(instance, validated_data)
+
+
+class LegacyAssigneeField(serializers.PrimaryKeyRelatedField):
+    """Deprecated: the one-assignee `assigned_to` of clients written before a record could have several. It reads as the
+    first assignee by name (null for none); writing it makes that user the only assignee (null: no one)."""
+
+    def __init__(self, **kwargs):
+        super().__init__(
+            queryset=User.objects.all(), pk_field=serializers.IntegerField(), required=False, allow_null=True, **kwargs,
+        )
+
+    def use_pk_only_optimization(self):
+        return False
+
+    def get_attribute(self, record):
+        return record.assigned_to  # LegacyAssigneeMixin
+
+
+class AssigneesSerializer(serializers.Serializer):
+    """Who a record (a lead, an activity) is assigned to: any number of users, listed by name.
+    - `assignee_ids` (write): their ids. It replaces the assignees: [] for no one.
+    - `assignees` (read): their ids and names.
+    - `assigned_to` and `assigned_to_name`: the one-assignee fields of earlier clients, kept working but deprecated.
+      `assigned_to` is the first assignee by name, and writing it sets that one user (see LegacyAssigneeField);
+      `assigned_to_name` is every assignee's name, joined by commas, or null.
+    A request sets them with `assignee_ids` or with `assigned_to`, not both. validate() turns either into `assignees` and
+    records which one was sent in `assignees_field`, for the subclasses' messages."""
+
+    assignee_ids = serializers.PrimaryKeyRelatedField(
+        many=True, source='assignees', queryset=User.objects.all(), pk_field=serializers.IntegerField(), required=False,
+        write_only=True,
+    )
+    assignees = serializers.SerializerMethodField()
+    assigned_to = LegacyAssigneeField()
+    assigned_to_name = serializers.SerializerMethodField()
+    assignees_field = 'assignee_ids'
+
+    def get_assignees(self, record):
+        return [{'id': user.pk, 'name': user.name} for user in by_name(record.assignees.all())]
+
+    def get_assigned_to_name(self, record):
+        return ', '.join(user.name for user in by_name(record.assignees.all())) or None
+
+    def validate(self, attrs):
+        if 'assigned_to' in attrs:
+            if 'assignees' in attrs:
+                raise serializers.ValidationError({'assigned_to': 'Send assignee_ids or assigned_to, not both.'})
+            user = attrs.pop('assigned_to')
+            attrs['assignees'] = [user] if user else []
+            self.assignees_field = 'assigned_to'
+        if 'assignees' in attrs:
+            attrs['assignees'] = list(dict.fromkeys(attrs['assignees']))  # each once
+        return attrs
+
+    def current_assignees(self):
+        return set(self.instance.assignees.all()) if self.instance else set()
+
+    def check_assignees(self, attrs, staff_may_add=()):
+        """Refuses (as a field error) anyone newly assigned who isn't active, and, for a requester who isn't an admin,
+        anyone newly assigned but `staff_may_add`. Someone already assigned stays, active or not."""
+        requester = self.context['request'].user
+        current = self.current_assignees()
+        added = [user for user in attrs.get('assignees', []) if user not in current]
+        if requester.role_id != Role.ADMIN and any(user not in staff_may_add for user in added):
+            return 'Only an admin can assign someone else.'
+        inactive = [user.name for user in added if not user.is_active]
+        if inactive:
+            return f"{', '.join(inactive)} can't be assigned: select active users only."
+        return None
 
 
 class DepartmentSerializer(serializers.ModelSerializer):

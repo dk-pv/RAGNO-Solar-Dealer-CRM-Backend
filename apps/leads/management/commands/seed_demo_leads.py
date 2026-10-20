@@ -270,6 +270,8 @@ class Command(BaseCommand):
                 )
                 follow_ups_added += added
                 missing = {field: value for field, value in details.items() if not getattr(follow_up, field)}
+                if missing.pop('assigned_to', None):
+                    follow_up.assignees.set([staff])
                 if missing:
                     Activity.objects.filter(pk=follow_up.pk).update(**missing)
 
@@ -278,7 +280,7 @@ class Command(BaseCommand):
         )
         statuses = Counter(seeded.values_list('status', flat=True))
         plan_counts = Counter(seeded.values_list('plan__name', flat=True))
-        people = Counter(seeded.values_list('assigned_to__name', flat=True))
+        people = Counter(seeded.values_list('assignees__name', flat=True))
         self.stdout.write(self.style.SUCCESS(
             f'Demo leads: {created} added, {present} already present, {seeded.count()} in total.'
         ))

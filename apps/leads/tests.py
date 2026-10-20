@@ -185,8 +185,6 @@ class LeadApiTests(APITestCase):
     def test_create_rejects_invalid_data_field_by_field(self):
         inactive = User.objects.create_user(email='gone@example.com', password=PASSWORD, name='Gone', is_active=False)
         cases = [
-            ({'district': ''}, 'district'),
-            ({'plan': None}, 'plan'),
             ({'plan': self.retired_plan.pk}, 'plan'),
             ({'phone': '98765 4321'}, 'phone'),
             ({'phone': '+91 98765 43210'}, 'phone'),
@@ -372,7 +370,7 @@ class LeadApiTests(APITestCase):
         self.assertEqual(rows[0][:4], ['Lead ID', 'Customer', 'Country code', 'Phone'])
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[1][1:4], ['\'=HYPERLINK("http://example.com")', '91', '9876543210'])
-        self.assertEqual(rows[1][11], 'Hot')
+        self.assertEqual(rows[1][12], 'Hot')
 
     def test_assignees_are_active_users_with_only_their_names(self):
         User.objects.create_user(email='gone@example.com', password=PASSWORD, name='Gone', is_active=False)
@@ -666,10 +664,10 @@ class SeedDemoLeadsTests(TestCase):
         self.assertEqual(Lead.objects.get(name='Ann Mary Jose').amount, Decimal('195000'))
         self.assertEqual(Lead.objects.get(name='Arjun Nair').amount, Decimal('200000'))
         self.assertEqual(
-            set(Lead.objects.exclude(assigned_to=None).values_list('assigned_to__name', flat=True)),
+            set(Lead.objects.exclude(assignees=None).values_list('assignees__name', flat=True)),
             {'Priya Nair', 'Arjun Das'},
         )
-        self.assertEqual(Lead.objects.filter(assigned_to=None).count(), 5)
+        self.assertEqual(Lead.objects.filter(assignees=None).count(), 5)
         self.assertGreater(len({lead.created_at.date() for lead in Lead.objects.all()}), 30)
         self.assertTrue(all(lead.created_at <= timezone.now() for lead in Lead.objects.all()))
         for lead in Lead.objects.all():

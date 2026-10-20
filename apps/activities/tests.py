@@ -90,7 +90,7 @@ class FollowUpFieldsTests(FollowUpTestCase):
             del body[field]
             response = self.client.post(reverse('activity-list'), body, format='json')
             self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, field)
-            self.assertIn(field, response.data)
+            self.assertIn('assignee_ids' if field == 'assigned_to' else field, response.data)
         for bad in ({'title': '   '}, {'due_date': None}, {'due_date': '03-10-2026'}, {'type': 'CONFIRMED'},
                     {'assigned_to': 999999}, {'description': None}):
             self.assertEqual(self.add(self.a_lead, **bad).status_code, status.HTTP_400_BAD_REQUEST, bad)
@@ -558,7 +558,7 @@ class ActivityOrderAndStatusRuleTests(FollowUpTestCase):
         # Reopening is an admin's, even for its assignee.
         self.assertEqual(self.patch(self.work_for_a.pk, status='PENDING').status_code, status.HTTP_403_FORBIDDEN)
         self.assertEqual(
-            list(Activity.objects.filter(work=self.work).order_by('pk').values_list('description', 'assigned_to', 'status')),
+            list(Activity.objects.filter(work=self.work).order_by('pk').values_list('description', 'assignees', 'status')),
             [('Unassigned.', None, 'PENDING'), ('For B.', self.staff_b.pk, 'PENDING'), ('For A.', self.staff_a.pk, 'COMPLETED')],
         )
         self.as_user(self.staff_b)

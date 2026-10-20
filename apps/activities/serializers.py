@@ -1,53 +1,55 @@
-from django.contrib.auth import get_user_model
 from django.utils import timezone
 from rest_framework import serializers
 
 from apps.accounts.models import Role
+from apps.accounts.serializers import AssigneesSerializer
 from apps.leads.models import Lead
 from apps.works.models import Work
 
 from .models import Activity, ActivityStatus, ActivityType
 
-User = get_user_model()
-
 ORDERINGS = ['created_at', 'due_date', 'status']
 
-
-def check_follow_up_assignee(user, requester, current):
-    """A lead's follow-up is assigned as leads are: an admin assigns any active user; staff assign one only to themselves
-    (or keep whoever an admin assigned it to)."""
-    if user == current:
-        return
-    if requester.role_id != Role.ADMIN and user != requester:
-        raise serializers.ValidationError('Only an admin can assign a follow-up to someone else.')
-    if not user.is_active:
-        raise serializers.ValidationError('Select an active user.')
+NO_ASSIGNEE = 'Choose at least one person to do the follow-up.'
 
 
-class FollowUpSerializer(serializers.ModelSerializer):
-    """A lead's follow-up's own fields and rules: a heading, a type, the staff member who does it, a due date and notes.
-    Used for the initial follow-up added with a new lead; ActivitySerializer applies the same rules to a lead's
-    follow-ups."""
+def check_follow_up_assignees(serializer, attrs, creating):
+    """A lead's follow-up's assignees, as a field error or None: at least one, and assigned as leads are (an admin
+    assigns any active users; staff assign only themselves, and keep whoever an admin chose)."""
+    if 'assignees' in attrs:
+        if not attrs['assignees']:
+            return NO_ASSIGNEE
+    elif creating:
+        return 'This field is required.'
+    return serializer.check_assignees(attrs, staff_may_add=[serializer.context['request'].user])
+
+
+class FollowUpSerializer(AssigneesSerializer, serializers.ModelSerializer):
+    """A lead's follow-up's own fields and rules: a heading, a type, the people who do it (assignee_ids, or the legacy
+    assigned_to), a due date and notes. Used for the initial follow-up added with a new lead; ActivitySerializer applies
+    the same rules to a lead's follow-ups."""
 
     title = serializers.CharField(max_length=150)
-    assigned_to = serializers.PrimaryKeyRelatedField(queryset=User.objects.all(), pk_field=serializers.IntegerField())
     due_date = serializers.DateField()
     description = serializers.CharField(required=False, allow_blank=True)
 
     class Meta:
         model = Activity
-        fields = ['title', 'type', 'assigned_to', 'due_date', 'description']
+        fields = ['title', 'type', 'assignee_ids', 'assigned_to', 'due_date', 'description']
 
-    def validate_assigned_to(self, user):
-        check_follow_up_assignee(user, self.context['request'].user, getattr(self.instance, 'assigned_to', None))
-        return user
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        if refused := check_follow_up_assignees(self, attrs, creating=self.instance is None):
+            raise serializers.ValidationError({self.assignees_field: refused})
+        return attrs
 
 
-class ActivitySerializer(serializers.ModelSerializer):
+class ActivitySerializer(AssigneesSerializer, serializers.ModelSerializer):
     """One activity of the log: a lead's follow-up or a Work's activity, each kind with its own rules.
-    - A lead's follow-up needs a heading, its staff (assigned as leads are) and a due date; notes are optional. It starts
-      Pending whatever the request says, and Completed is final.
-    - A Work's activity needs notes; its staff and due date are optional. It can be added completed, and reopened.
+    - A lead's follow-up needs a heading, at least one person to do it (assigned as leads are) and a due date; notes are
+      optional. It starts Pending whatever the request says, and Completed is final.
+    - A Work's activity needs notes; its people and due date are optional. It can be added completed, and reopened.
+    Its people are any number of active users (assignee_ids, or the legacy assigned_to: see AssigneesSerializer).
     Completing records when and by whom (and, through the complete action, an optional note); reopening clears them.
     Only admins add, edit and delete activities (ActivityAccess)."""
 
@@ -56,9 +58,6 @@ class ActivitySerializer(serializers.ModelSerializer):
     work = serializers.PrimaryKeyRelatedField(queryset=Work.objects.none(), pk_field=serializers.IntegerField(), required=False)
     # Which fields are required depends on the kind; validate() checks them.
     title = serializers.CharField(max_length=150, required=False, allow_blank=True)
-    assigned_to = serializers.PrimaryKeyRelatedField(
-        queryset=User.objects.all(), pk_field=serializers.IntegerField(), required=False, allow_null=True,
-    )
     due_date = serializers.DateField(required=False, allow_null=True)
     description = serializers.CharField(required=False, allow_blank=True)
     # The lead, so a list of follow-ups across leads shows whose each one is without asking for every lead. Null for a
@@ -67,7 +66,6 @@ class ActivitySerializer(serializers.ModelSerializer):
     lead_country_code = serializers.CharField(source='lead.country_code', read_only=True, allow_null=True)
     lead_phone = serializers.CharField(source='lead.phone', read_only=True, allow_null=True)
     type_display = serializers.CharField(source='get_type_display', read_only=True)
-    assigned_to_name = serializers.SerializerMethodField()
     completed_by_name = serializers.SerializerMethodField()
     created_by_name = serializers.SerializerMethodField()
     # Which Work a Work activity belongs to, for the tables that list several Works' activities; null for a lead's.
@@ -83,7 +81,8 @@ class ActivitySerializer(serializers.ModelSerializer):
         model = Activity
         fields = [
             'id', 'lead', 'work', 'lead_name', 'lead_country_code', 'lead_phone',
-            'title', 'type', 'type_display', 'assigned_to', 'assigned_to_name', 'due_date', 'description', 'status',
+            'title', 'type', 'type_display', 'assignee_ids', 'assignees', 'assigned_to', 'assigned_to_name', 'due_date',
+            'description', 'status',
             'completed_at', 'completed_by_name', 'completion_note', 'created_by_name', 'created_at', 'updated_at',
             'work_summary', 'can_edit', 'can_delete', 'can_open_lead', 'can_update_status',
         ]
@@ -101,9 +100,6 @@ class ActivitySerializer(serializers.ModelSerializer):
             fields['work'].queryset = Work.objects.all()
         return fields
 
-    def get_assigned_to_name(self, activity):
-        return activity.assigned_to.name if activity.assigned_to else None
-
     def get_completed_by_name(self, activity):
         return activity.completed_by.name if activity.completed_by else None
 
@@ -120,8 +116,9 @@ class ActivitySerializer(serializers.ModelSerializer):
         }
 
     def works_the_lead(self, activity):
+        # From the prefetched assignees of the lead (ActivityViewSet), not a query per row.
         user = self.context['request'].user
-        return user.role_id == Role.ADMIN or activity.lead.assigned_to_id == user.pk
+        return user.role_id == Role.ADMIN or any(person.pk == user.pk for person in activity.lead.assignees.all())
 
     def get_can_edit(self, activity):
         # Editing, reassigning and reopening are for admins; staff complete their own activities.
@@ -152,6 +149,7 @@ class ActivitySerializer(serializers.ModelSerializer):
         return work
 
     def validate(self, attrs):
+        attrs = super().validate(attrs)
         if self.instance is None:
             if bool(attrs.get('lead')) == bool(attrs.get('work')):
                 raise serializers.ValidationError('Choose the lead or the Work this activity is for.')
@@ -175,20 +173,14 @@ class ActivitySerializer(serializers.ModelSerializer):
         """A lead's follow-up: the field errors, if any."""
         errors = {}
         creating = self.instance is None
-        for field, empty in (('title', 'This field may not be blank.'), ('assigned_to', 'This field may not be null.'),
-                             ('due_date', 'This field may not be null.')):
+        for field, empty in (('title', 'This field may not be blank.'), ('due_date', 'This field may not be null.')):
             if field in attrs:
                 if attrs[field] in (None, ''):
                     errors[field] = [empty]
             elif creating:
                 errors[field] = ['This field is required.']
-        if attrs.get('assigned_to'):
-            try:
-                check_follow_up_assignee(
-                    attrs['assigned_to'], self.context['request'].user, getattr(self.instance, 'assigned_to', None),
-                )
-            except serializers.ValidationError as error:
-                errors['assigned_to'] = error.detail
+        if refused := check_follow_up_assignees(self, attrs, creating):
+            errors[self.assignees_field] = [refused]
         if creating:
             # Every new follow-up starts Pending, whatever the request says; it is completed by changing its status after.
             attrs['status'] = ActivityStatus.PENDING
@@ -204,10 +196,10 @@ class ActivitySerializer(serializers.ModelSerializer):
                 errors['description'] = ['This field may not be blank.']
         elif self.instance is None:
             errors['description'] = ['This field is required.']
-        # An inactive user may stay on an activity that already has them, but can't be newly assigned.
-        user = attrs.get('assigned_to')
-        if user and not user.is_active and user != getattr(self.instance, 'assigned_to', None):
-            errors['assigned_to'] = ['Select an active user.']
+        # An inactive user may stay on an activity that already has them, but can't be newly assigned. (Only admins add
+        # and edit Work activities, so anyone active may be chosen.)
+        if refused := self.check_assignees(attrs):
+            errors[self.assignees_field] = [refused]
         return errors
 
 

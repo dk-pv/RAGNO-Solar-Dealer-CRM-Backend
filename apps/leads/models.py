@@ -7,7 +7,7 @@ from django.db.models import Q
 from django.db.models.functions import Concat
 from rest_framework.exceptions import APIException
 
-from apps.accounts.models import Role
+from apps.accounts.models import LegacyAssigneeMixin, Role
 
 
 class LeadConflict(APIException):
@@ -64,12 +64,13 @@ class LeadQuerySet(models.QuerySet):
     def visible_to(self, user):
         """The leads a user works with: every lead for an admin, only the leads assigned to them for staff.
         What they may do with those leads still comes from their role (the Leads module's permissions)."""
-        return self if user.role_id == Role.ADMIN else self.filter(assigned_to=user)
+        # One row per lead: the join matches at most one of a lead's assignees.
+        return self if user.role_id == Role.ADMIN else self.filter(assignees=user)
 
     def search(self, text, details=True):
-        """The leads a search box entry finds: by name, email, area, district or PIN code; by phone number, with or
-        without its country code, ignoring spaces and a leading 0; or by ID, so "1024" and "#1024" find lead 1024.
-        Without `details`, only by name, phone or ID."""
+        """The leads a search box entry finds: by name, email, area, district, PIN code or dealer name; by phone number,
+        with or without its country code, ignoring spaces and a leading 0; or by ID, so "1024" and "#1024" find lead
+        1024. Without `details`, only by name, phone or ID."""
         text = text.strip()
         if not text:
             return self
@@ -77,7 +78,7 @@ class LeadQuerySet(models.QuerySet):
         if details:
             match |= (
                 Q(email__icontains=text) | Q(area__icontains=text) | Q(district__icontains=text)
-                | Q(pin_code__icontains=text)
+                | Q(pin_code__icontains=text) | Q(dealer_name__icontains=text)
             )
         if re.fullmatch(r'[0-9\s()+-]+', text):
             digits = re.sub(r'[^0-9]', '', text).lstrip('0')
@@ -89,7 +90,9 @@ class LeadQuerySet(models.QuerySet):
         return self.annotate(full_phone=Concat('country_code', 'phone')).filter(match)
 
 
-class Lead(models.Model):
+class Lead(LegacyAssigneeMixin, models.Model):
+    """A sales enquiry. Only the customer's name and phone number are required; the rest is filled in as it is known."""
+
     name = models.CharField(max_length=150)
     # Kept apart from the number, so WhatsApp and call links never guess the country: "91" + "9876543210".
     country_code = models.CharField(
@@ -103,24 +106,25 @@ class Lead(models.Model):
     )
     email = models.EmailField(blank=True)
     state = models.CharField(max_length=100, blank=True)
-    district = models.CharField(max_length=100)
+    district = models.CharField(max_length=100, blank=True)
     area = models.CharField(max_length=150, blank=True)
     pin_code = models.CharField(
         max_length=6,
         blank=True,
         validators=[RegexValidator(r'^[1-9][0-9]{5}$', 'Enter a 6-digit PIN code.')],
     )
-    plan = models.ForeignKey(SolarPlan, on_delete=models.PROTECT, related_name='leads')
-    # The lead's own price. It starts as the plan's current price and never follows later price changes.
-    amount = models.DecimalField(max_digits=12, decimal_places=2, validators=[MinValueValidator(0)])
+    # The dealer the enquiry came through, if any.
+    dealer_name = models.CharField(max_length=150, blank=True)
+    # Optional until the customer chooses a system; a lead needs one (and its amount) to be converted into a Work.
+    plan = models.ForeignKey(SolarPlan, on_delete=models.PROTECT, null=True, blank=True, related_name='leads')
+    # The lead's own price. It starts as the plan's current price when a plan is chosen and never follows later price
+    # changes. Empty while there is no plan and none was entered.
+    amount = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True, validators=[MinValueValidator(0)])
     status = models.CharField(max_length=20, choices=LeadStatus.choices, default=LeadStatus.NEW)
     source = models.CharField(max_length=20, choices=LeadSource.choices, blank=True)
-    assigned_to = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.PROTECT,
-        null=True,
-        blank=True,
-        related_name='assigned_leads',
+    # Any number of staff work the lead (see LeadAssignee).
+    assignees = models.ManyToManyField(
+        settings.AUTH_USER_MODEL, through='LeadAssignee', blank=True, related_name='assigned_leads',
     )
     next_follow_up = models.DateField(null=True, blank=True)
     notes = models.TextField(blank=True)
@@ -169,8 +173,9 @@ class Lead(models.Model):
         self.status, self.updated_at = lead.status, lead.updated_at
 
     def convert(self, user):
-        """Creates the Work for a Won lead. Only Won leads convert, each only once, and converting never changes the
-        lead's status: whoever works the lead moves it to Won first, and it stays Won."""
+        """Creates the Work for a Won lead. Only Won leads convert, each only once, and only with a plan and an amount (the
+        Work's confirmed price); converting never changes the lead's status: whoever works the lead moves it to Won
+        first, and it stays Won."""
         # The Works module copies the customer, plan and lead.amount into the Work. Imported here because the Works
         # module depends on leads, not the other way round.
         from apps.works.models import Work
@@ -182,6 +187,19 @@ class Lead(models.Model):
                 raise LeadConflict('Only Won leads can be converted.')
             if Work.objects.filter(lead=lead).exists():
                 raise LeadConflict('This lead has already been converted.')
+            if lead.plan_id is None or lead.amount is None:
+                raise LeadConflict("Choose the lead's solar plan and amount before converting it to a Work.")
             self.work = Work.create_for_lead(lead, user)
         # As the locked row has it (Won), should this copy have been read before a concurrent move to Won committed.
         self.status, self.updated_at = lead.status, lead.updated_at
+
+
+class LeadAssignee(models.Model):
+    """One of the staff a lead is assigned to. PROTECT, as the one assignee was: someone with assigned leads is
+    deactivated, never deleted (see the Users API)."""
+
+    lead = models.ForeignKey(Lead, on_delete=models.CASCADE, related_name='+')
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name='+')
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=['lead', 'user'], name='leads_assignee_once_per_lead')]

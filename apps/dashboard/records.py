@@ -11,6 +11,7 @@ from django.contrib.auth import get_user_model
 from django.db.models import BigIntegerField, CharField, F, OuterRef, Subquery, Value
 from django.db.models.functions import Cast
 
+from apps.accounts.models import by_name
 from apps.activities.models import Activity, ActivityType
 from apps.leads.models import Lead
 from apps.works.models import Work
@@ -38,6 +39,11 @@ def name(user):
     return user.name if user else None
 
 
+def names(users):
+    """Several people (a lead's or an activity's assignees) as one line: their names by name, or None."""
+    return ', '.join(user.name for user in by_name(users)) or None
+
+
 def with_latest_activity(records, field):
     """Each record with its newest activity's type and time, in the same query (None when it has no activity)."""
     latest = Activity.objects.filter(**{field: OuterRef('pk')}).order_by('-created_at', '-pk')
@@ -56,7 +62,7 @@ def latest_activity(record):
 def lead_summary(lead):
     return {
         'id': lead.pk, 'customer_name': lead.name, 'status': lead.status, 'status_display': lead.get_status_display(),
-        'assigned_to_name': name(lead.assigned_to), 'created_at': lead.created_at, 'updated_at': lead.updated_at,
+        'assigned_to_name': names(lead.assignees.all()), 'created_at': lead.created_at, 'updated_at': lead.updated_at,
         'latest_activity': latest_activity(lead),
     }
 
@@ -131,7 +137,7 @@ def describe_events(rows):
     work_ids = {row['ev_work'] for row in rows if row['ev_work']}
     activity_ids = {row['ev_activity'] for row in rows if row['ev_activity']}
     user_ids = {row['ev_user'] for row in rows if row['ev_user']}
-    leads = with_latest_activity(Lead.objects.filter(pk__in=lead_ids).select_related('assigned_to'), 'lead')
+    leads = with_latest_activity(Lead.objects.filter(pk__in=lead_ids).prefetch_related('assignees'), 'lead')
     works = with_latest_activity(Work.objects.filter(pk__in=work_ids).select_related('assigned_to'), 'work')
     leads = {lead.pk: lead_summary(lead) for lead in leads} if lead_ids else {}
     works = {work.pk: work_summary(work) for work in works} if work_ids else {}

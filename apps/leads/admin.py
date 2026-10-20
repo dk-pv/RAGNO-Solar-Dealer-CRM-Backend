@@ -11,8 +11,8 @@ class SolarPlanAdmin(admin.ModelAdmin):
 
 @admin.register(Lead)
 class LeadAdmin(admin.ModelAdmin):
-    list_display = ['id', 'name', 'phone', 'district', 'plan', 'amount', 'status', 'assigned_to', 'created_at']
-    list_select_related = ['plan', 'assigned_to']
+    list_display = ['id', 'name', 'phone', 'district', 'plan', 'amount', 'status', 'created_at']
+    list_select_related = ['plan']
     list_filter = ['status', 'plan']
     search_fields = ['name', 'phone', 'email']
     # The status only changes through the CRM, which applies the pipeline rules.

@@ -129,7 +129,7 @@ class StaffAccessTestCase(APITestCase):
     def stored(self):
         """Every activity as stored, to show a refused request changed nothing."""
         return list(Activity.objects.order_by('pk').values_list(
-            'lead', 'work', 'title', 'type', 'assigned_to', 'due_date', 'description', 'status', 'completed_at',
+            'lead', 'work', 'title', 'type', 'assignees', 'due_date', 'description', 'status', 'completed_at',
             'completed_by', 'completion_note', 'updated_at',
         ))
 
@@ -201,7 +201,7 @@ class StaffModuleAccessTests(StaffAccessTestCase):
     def records(self):
         """Everything the refused requests asked to change."""
         return (
-            list(Lead.objects.order_by('pk').values_list('name', 'status', 'district', 'assigned_to', 'is_pinned')),
+            list(Lead.objects.order_by('pk').values_list('name', 'status', 'district', 'assignees', 'is_pinned')),
             list(Work.objects.order_by('pk').values_list('lead', 'stage', 'assigned_to')),
             list(User.objects.order_by('pk').values_list('email', 'name', 'role', 'is_active')),
             sorted(Role.objects.get(pk=Role.STAFF).permissions.values_list('codename', flat=True)),

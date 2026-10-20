@@ -1,7 +1,7 @@
 from django.conf import settings
 from django.db import models
 
-from apps.accounts.models import Role
+from apps.accounts.models import LegacyAssigneeMixin, Role
 
 
 class ActivityType(models.TextChoices):
@@ -19,12 +19,13 @@ class ActivityStatus(models.TextChoices):
 
 class ActivityQuerySet(models.QuerySet):
     def visible_to(self, user):
-        """The activities a user sees: every one for an admin; for staff only those assigned to them, on any lead or
-        Work. Never another staff member's, an admin's or an unassigned one, whoever the lead or Work belongs to."""
-        return self if user.role_id == Role.ADMIN else self.filter(assigned_to=user)
+        """The activities a user sees: every one for an admin; for staff only those assigned to them (alone or with
+        others), on any lead or Work. Never one that isn't assigned to them, whoever the lead or Work belongs to. One row
+        per activity: the join matches at most one of its assignees."""
+        return self if user.role_id == Role.ADMIN else self.filter(assignees=user)
 
 
-class Activity(models.Model):
+class Activity(LegacyAssigneeMixin, models.Model):
     """The CRM's one activity log: each activity belongs to exactly one lead or one Work.
     A lead's follow-up has a heading, a type, who does it, when it is due and notes; it is Pending until someone marks it
     Completed, which is final. A Work's activity is its history: a type, notes, optionally who does it and when, and it
@@ -39,13 +40,10 @@ class Activity(models.Model):
     # existed, and Work activities, keep an empty one rather than an invented one.
     title = models.CharField(max_length=150, blank=True, default='')
     type = models.CharField(max_length=20, choices=ActivityType.choices)
-    # Who does it: for a lead's follow-up, separate from the lead's assigned staff and required for new ones.
-    assigned_to = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.PROTECT,
-        null=True,
-        blank=True,
-        related_name='assigned_activities',
+    # Who does it, one person or several (see ActivityAssignee): for a lead's follow-up, separate from the lead's
+    # assigned staff and at least one for new ones.
+    assignees = models.ManyToManyField(
+        settings.AUTH_USER_MODEL, through='ActivityAssignee', blank=True, related_name='assigned_activities',
     )
     # Notes: optional on a lead's follow-up, required on a Work's activity (the API checks both).
     description = models.TextField(blank=True)
@@ -101,7 +99,19 @@ class Activity(models.Model):
         return self.title or f'{self.get_type_display()}: {self.lead or self.work}'
 
     def status_changeable_by(self, user):
-        """Whether `user` may open and complete this activity: an admin, or the staff member it is assigned to. Never
-        another staff member, and no staff member for an activity assigned to no one (it can't be taken over first:
-        editing and reassigning are for admins)."""
-        return user.role_id == Role.ADMIN or self.assigned_to_id == user.pk
+        """Whether `user` may open and complete this activity: an admin, or a staff member it is assigned to (any of its
+        assignees: completing it completes it for all of them). Never another staff member, and no staff member for an
+        activity assigned to no one (it can't be taken over first: editing and reassigning are for admins). Reads the
+        prefetched assignees when there are some."""
+        return user.role_id == Role.ADMIN or any(assignee.pk == user.pk for assignee in self.assignees.all())
+
+
+class ActivityAssignee(models.Model):
+    """One of the people an activity is assigned to. PROTECT, as the one assignee was: someone with assigned activities
+    is deactivated, never deleted (see the Users API)."""
+
+    activity = models.ForeignKey(Activity, on_delete=models.CASCADE, related_name='+')
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name='+')
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=['activity', 'user'], name='activities_assignee_once_per_activity')]

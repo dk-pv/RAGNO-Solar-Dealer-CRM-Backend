@@ -53,6 +53,36 @@ class Department(models.Model):
         return self.name
 
 
+def by_name(users):
+    """Users in the order the CRM lists people: by name, then by id."""
+    return sorted(users, key=lambda user: (user.name, user.pk))
+
+
+class LegacyAssigneeMixin:
+    """For a model whose `assignees` (a lead's, an activity's) replaced the one `assigned_to` it used to have: the old
+    attribute, for code and scripts written against it. Reading it gives the first assignee by name (None for none);
+    setting it, also as a create() keyword, makes that user the only assignee (None: no one) once the record is saved.
+    Queries can't use it: filter on `assignees`."""
+
+    @property
+    def assigned_to(self):
+        if hasattr(self, '_pending_assignee'):
+            return self._pending_assignee
+        if self.pk is None:
+            return None
+        return next(iter(by_name(self.assignees.all())), None)
+
+    @assigned_to.setter
+    def assigned_to(self, user):
+        self._pending_assignee = user
+
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        if hasattr(self, '_pending_assignee'):
+            self.assignees.set([self._pending_assignee] if self._pending_assignee else [])
+            del self._pending_assignee
+
+
 class UserManager(BaseUserManager):
     use_in_migrations = True
 

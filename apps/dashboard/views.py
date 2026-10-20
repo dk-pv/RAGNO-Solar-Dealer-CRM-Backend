@@ -27,7 +27,9 @@ from apps.activities.models import Activity, ActivityStatus
 from apps.leads.models import PIPELINE, LeadStatus
 from apps.works.models import WorkStage
 
-from .records import EVENT_RECORDS, describe_events, event_feed, lead_summary, name, visible, with_latest_activity, work_summary
+from .records import (
+    EVENT_RECORDS, describe_events, event_feed, lead_summary, name, names, visible, with_latest_activity, work_summary,
+)
 
 FOLLOW_UP_BUCKETS = ['overdue', 'today', 'upcoming', 'pending', 'completed']
 RECENT = 5
@@ -64,10 +66,10 @@ def follow_up_counts(user, leads, works, today, mine=False):
     sources = {'works': None, 'leads': None}
     if works is not None:
         pending = Activity.objects.filter(work__isnull=False, status=ActivityStatus.PENDING)
-        sources['works'] = counts(pending.filter(assigned_to=user) if mine else pending, 'due_date')
+        sources['works'] = counts(pending.filter(assignees=user) if mine else pending, 'due_date')
     if leads is not None:
         scheduled = scheduled_lead_follow_ups(leads)
-        sources['leads'] = counts(scheduled.filter(assigned_to=user) if mine else scheduled, 'next_follow_up')
+        sources['leads'] = counts(scheduled.filter(assignees=user) if mine else scheduled, 'next_follow_up')
     total = {
         key: sum(source[key] for source in sources.values() if source)
         for key in ('pending', 'overdue', 'today', 'upcoming')
@@ -103,7 +105,7 @@ class SummaryView(APIView):
             )
         data['follow_ups'] = follow_up_counts(user, leads, works, today)
         data['mine'] = {
-            'leads': None if leads is None else leads.filter(assigned_to=user, status__in=PIPELINE).count(),
+            'leads': None if leads is None else leads.filter(assignees=user, status__in=PIPELINE).count(),
             'works': None if works is None else works.filter(assigned_to=user).exclude(stage=WorkStage.COMPLETED).count(),
             'follow_ups': follow_up_counts(user, leads, works, today, mine=True),
         }
@@ -115,7 +117,7 @@ def work_follow_up(activity):
     return {
         'key': f'activity-{activity.pk}', 'source': 'work', 'activity': activity.pk, 'lead': None, 'work': work.pk,
         'title': activity.get_type_display(), 'description': activity.description, 'customer_name': work.customer_name,
-        'assigned_to_name': name(activity.assigned_to), 'due_date': activity.due_date, 'status': activity.status,
+        'assigned_to_name': names(activity.assignees.all()), 'due_date': activity.due_date, 'status': activity.status,
         'created_at': activity.created_at, 'created_by_name': name(activity.created_by),
         'completed_at': activity.completed_at, 'completed_by_name': name(activity.completed_by),
     }
@@ -126,7 +128,7 @@ def lead_follow_up(lead):
     return {
         'key': f'lead-{lead.pk}', 'source': 'lead', 'activity': None, 'lead': lead.pk, 'work': None,
         'title': 'Next follow-up', 'description': '', 'customer_name': lead.name,
-        'assigned_to_name': name(lead.assigned_to), 'due_date': lead.next_follow_up, 'status': ActivityStatus.PENDING,
+        'assigned_to_name': names(lead.assignees.all()), 'due_date': lead.next_follow_up, 'status': ActivityStatus.PENDING,
         'created_at': None, 'created_by_name': None, 'completed_at': None, 'completed_by_name': None,
     }
 
@@ -153,10 +155,10 @@ class FollowUpsView(APIView):
 
         if works is not None:
             activities = Activity.objects.filter(work__isnull=False).select_related(
-                'work', 'assigned_to', 'created_by', 'completed_by',
-            )
+                'work', 'created_by', 'completed_by',
+            ).prefetch_related('assignees')
             if mine:
-                activities = activities.filter(assigned_to=user)
+                activities = activities.filter(assignees=user)
             if bucket == 'completed':
                 activities = activities.filter(status=ActivityStatus.COMPLETED).order_by('-completed_at', '-pk')
             else:
@@ -167,9 +169,9 @@ class FollowUpsView(APIView):
 
         # Leads have no completed follow-ups to list: completing one means scheduling the next date or closing the lead.
         if leads is not None and bucket != 'completed':
-            scheduled = scheduled_lead_follow_ups(leads).select_related('assigned_to')
+            scheduled = scheduled_lead_follow_ups(leads).prefetch_related('assignees')
             if mine:
-                scheduled = scheduled.filter(assigned_to=user)
+                scheduled = scheduled.filter(assignees=user)
             scheduled = scheduled.filter(**due_filter('next_follow_up', bucket, today)).order_by('next_follow_up', 'pk')
             count += scheduled.count()
             items += [lead_follow_up(lead) for lead in scheduled[:limit]]
@@ -190,7 +192,7 @@ class RecentView(APIView):
         leads, works = visible(request.user)
         data = {'leads': None, 'works': None}
         if leads is not None:
-            recent = with_latest_activity(leads.select_related('assigned_to'), 'lead').order_by('-updated_at', '-pk')
+            recent = with_latest_activity(leads.prefetch_related('assignees'), 'lead').order_by('-updated_at', '-pk')
             data['leads'] = [lead_summary(lead) for lead in recent[:RECENT]]
         if works is not None:
             recent = with_latest_activity(works.select_related('assigned_to'), 'work').order_by('-updated_at', '-pk')

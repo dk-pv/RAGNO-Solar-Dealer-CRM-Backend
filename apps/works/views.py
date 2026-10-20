@@ -158,7 +158,8 @@ class WorkViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.Updat
 
     @action(detail=False, methods=['post'], url_path='bulk-delete')
     def bulk_delete(self, request):
-        """Admins only. Removes the selected Works and their activities; each lead stays Won and can be converted again."""
+        """Admins only. Removes the selected Works with their activities and documents; each lead stays Won and can be
+        converted again. The All Works row menu deletes one Work through here too."""
         body = BulkIdsSerializer(data=request.data)
         body.is_valid(raise_exception=True)
         files = []
@@ -169,6 +170,11 @@ class WorkViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.Updat
         # After the Works' own commit hooks, which fill `files`: their documents' files in one go, 100 per Cloudinary
         # request, rather than a request per Work.
         transaction.on_commit(lambda: storage.delete(files), robust=True)
+        # Their documents are gone for good, so who deleted them goes to the server log (as a document's deletion does).
+        if deleted := response.data['succeeded']:
+            transaction.on_commit(lambda: logger.warning(
+                'Works %s deleted by user %s, with their activities and documents', deleted, request.user.pk,
+            ))
         return response
 
     @action(detail=False)

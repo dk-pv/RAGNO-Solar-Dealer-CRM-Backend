@@ -30,7 +30,9 @@ from rest_framework.views import APIView
 
 from apps.accounts.models import Role, User
 from apps.activities.models import Activity, ActivityStatus, ActivityType
-from apps.dashboard.records import EVENT_KINDS, EVENT_RECORDS, describe_events, event_feed, latest_activity, name, visible, with_latest_activity
+from apps.dashboard.records import (
+    EVENT_KINDS, EVENT_RECORDS, describe_events, event_feed, latest_activity, name, names, visible, with_latest_activity,
+)
 from apps.leads.models import PIPELINE, Lead, LeadSource, LeadStatus
 from apps.leads.views import STATUS_RANK
 from apps.works.models import Work, WorkStage
@@ -135,8 +137,9 @@ def trend(params, **series):
     return {'unit': unit, 'points': points}
 
 
-def by_user(records, field='assigned_to', **aggregates):
-    """Counts per user (and one row for none), ordered by name. Facts only: no ranking."""
+def by_user(records, field='assignees', **aggregates):
+    """Counts per user (and one row for none), ordered by name. Facts only: no ranking. A record with several
+    assignees counts once for each of them."""
     rows = records.order_by().values(field, f'{field}__name').annotate(count=Count('pk'), **aggregates)
     result = [
         {'id': row[field], 'name': row[f'{field}__name'], 'count': row['count'], **{key: row[key] for key in aggregates}}
@@ -222,7 +225,7 @@ def lead_records(user, params):
     if 'status' in params:
         leads = leads.filter(status=params['status'])
     if 'assigned_to' in params:
-        leads = leads.filter(assigned_to=params['assigned_to'])
+        leads = leads.filter(assignees=params['assigned_to'])  # one of them, or None: assigned to no one
     if 'source' in params:
         leads = leads.filter(source='' if params['source'] == 'none' else params['source'])
     return leads
@@ -256,9 +259,9 @@ class LeadReportView(RowsView):
         ('Lead ID', lambda lead: lead.pk),
         ('Customer', lambda lead: lead.name),
         ('Status', lambda lead: lead.get_status_display()),
-        ('Assigned to', lambda lead: name(lead.assigned_to) or 'Unassigned'),
+        ('Assigned to', lambda lead: names(lead.assignees.all()) or 'Unassigned'),
         ('Source', lambda lead: lead.get_source_display() or 'Not set'),
-        ('Plan', lambda lead: lead.plan.name),
+        ('Plan', lambda lead: lead.plan.name if lead.plan else 'Not set'),
         ('Amount', lambda lead: lead.amount),
         ('Created', lambda lead: lead.created_at),
         ('Last updated', lambda lead: lead.updated_at),
@@ -266,14 +269,15 @@ class LeadReportView(RowsView):
     ]
 
     def records(self, params):
-        leads = lead_records(self.request.user, params).select_related('assigned_to', 'plan')
+        leads = lead_records(self.request.user, params).select_related('plan').prefetch_related('assignees')
         return with_latest_activity(leads, 'lead').order_by(*LEAD_ORDERS[params.get('ordering', '-created_at')])
 
     def row(self, lead):
         return {
             'id': lead.pk, 'customer_name': lead.name, 'status': lead.status, 'status_display': lead.get_status_display(),
-            'assigned_to': lead.assigned_to_id, 'assigned_to_name': name(lead.assigned_to), 'source': lead.source,
-            'source_display': lead.get_source_display(), 'plan_name': lead.plan.name, 'amount': money(lead.amount),
+            'assigned_to': lead.assigned_to.pk if lead.assigned_to else None, 'assigned_to_name': names(lead.assignees.all()),
+            'source': lead.source, 'source_display': lead.get_source_display(), 'plan_name': lead.plan.name if lead.plan else None,
+            'amount': None if lead.amount is None else money(lead.amount),
             'created_at': lead.created_at, 'updated_at': lead.updated_at, 'latest_activity': latest_activity(lead),
         }
 
@@ -334,7 +338,7 @@ class WorkSummaryView(SummaryView):
             ],
             'by_staff': [
                 {**row, 'amount': money(row.pop('value'))}
-                for row in by_user(works, value=Sum('amount'), completed=Count('pk', filter=completed))
+                for row in by_user(works, 'assigned_to', value=Sum('amount'), completed=Count('pk', filter=completed))
             ],
             # Each point: the Works created and their confirmed value (created_value).
             'trend': trend(params, created=(works, 'created_at', {'value': Sum('amount')})),
@@ -408,9 +412,11 @@ def activity_records(user, params, period=True):
     activities = Activity.objects.filter(scope)
     if params.get('record'):
         activities = activities.filter(**{f"{params['record']}__isnull": False})
-    for field in ('type', 'assigned_to', 'lead', 'work'):
+    for field in ('type', 'lead', 'work'):
         if field in params:
             activities = activities.filter(**{field: params[field]})
+    if 'assigned_to' in params:
+        activities = activities.filter(assignees=params['assigned_to'])  # one of them, or None: assigned to no one
     # Pending, completed and overdue are a Work's follow-ups: a lead's activities have no such status.
     if 'status' in params:
         activities = activities.filter(work__isnull=False, status=params['status'])
@@ -478,7 +484,7 @@ class ActivityReportView(RowsView):
         ('Description', lambda activity: activity.description),
         ('Lead / Work', record_label),
         ('Customer', lambda activity: activity.work.customer_name if activity.work_id else activity.lead.name),
-        ('Assigned to', lambda activity: name(activity.assigned_to) or 'Unassigned'),
+        ('Assigned to', lambda activity: names(activity.assignees.all()) or 'Unassigned'),
         ('Due date', lambda activity: activity.due_date),
         ('Status', lambda activity: activity.get_status_display() if activity.work_id else 'Log'),
         ('Created', lambda activity: activity.created_at),
@@ -489,8 +495,8 @@ class ActivityReportView(RowsView):
 
     def records(self, params):
         activities = activity_records(self.request.user, params).select_related(
-            'lead', 'work', 'assigned_to', 'created_by', 'completed_by',
-        )
+            'lead', 'work', 'created_by', 'completed_by',
+        ).prefetch_related('assignees')
         return activities.order_by(*ACTIVITY_ORDERS[params.get('ordering', '-created_at')])
 
     def row(self, activity):
@@ -500,7 +506,8 @@ class ActivityReportView(RowsView):
             'id': activity.pk, 'type': activity.type, 'type_display': activity.get_type_display(),
             'description': activity.description, 'lead': activity.lead_id, 'work': activity.work_id,
             'customer_name': activity.work.customer_name if on_work else activity.lead.name,
-            'assigned_to': activity.assigned_to_id, 'assigned_to_name': name(activity.assigned_to),
+            'assigned_to': activity.assigned_to.pk if activity.assigned_to else None,
+            'assigned_to_name': names(activity.assignees.all()),
             'due_date': activity.due_date,
             # null for a lead's activity: its log has no follow-up status.
             'status': activity.status if on_work else None,
@@ -550,14 +557,14 @@ class StaffReportView(APIView):
         activities = activity_records(user, {'date_field': 'created'}, period=False)
         if leads is not None:
             period_leads = in_period(leads, 'created_at', params)
-            add(period_leads, 'assigned_to', leads_assigned=Count('pk'))
+            add(period_leads, 'assignees', leads_assigned=Count('pk'))
             add(period_leads, 'created_by', leads_added=Count('pk'))
         if works is not None:
             period_works = in_period(works, 'created_at', params)
             add(period_works, 'assigned_to', works_assigned=Count('pk'))
             add(period_works, 'created_by', works_converted=Count('pk'))
         period_activities = in_period(activities, 'created_at', params)
-        add(period_activities, 'assigned_to', activities_assigned=Count('pk'), **follow_up_counts(today))
+        add(period_activities, 'assignees', activities_assigned=Count('pk'), **follow_up_counts(today))
         add(period_activities, 'created_by', activities_added=Count('pk'))
         add(in_period(activities.filter(completed_at__isnull=False), 'completed_at', params), 'completed_by', follow_ups_completed=Count('pk'))
 

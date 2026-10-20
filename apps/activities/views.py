@@ -53,9 +53,9 @@ def filter_follow_ups(follow_ups, query_params, user):
     for field in ('status', 'type'):
         if field in params:
             follow_ups = follow_ups.filter(**{field: params[field]})
-    # The follow-up's own staff (not the lead's).
+    # The follow-ups this user is one of the assignees of: the follow-up's own (not the lead's). One row each.
     if 'assigned_to' in params:
-        follow_ups = follow_ups.filter(assigned_to_id=params['assigned_to'])
+        follow_ups = follow_ups.filter(assignees=params['assigned_to'])
     if 'due_after' in params:
         follow_ups = follow_ups.filter(due_date__gte=params['due_after'])
     if 'due_before' in params:
@@ -115,8 +115,11 @@ class ActivityViewSet(
     lookup_value_regex = '[0-9]+'
 
     def get_queryset(self):
-        # The lead, the Work and its plan come in the same query: no query per row.
-        activities = Activity.objects.select_related('lead', 'work__plan', 'assigned_to', 'completed_by', 'created_by')
+        # The lead, the Work and its plan come in the same query, and the assignees (the activity's and its lead's) in one
+        # more each: no query per row.
+        activities = Activity.objects.select_related('lead', 'work__plan', 'completed_by', 'created_by').prefetch_related(
+            'assignees', 'lead__assignees',
+        )
         if self.detail:
             # One activity is looked up among all of them: someone else's answers 403 (ActivityAccess), an unknown id 404.
             # Completing locks it, so two requests at once (or a reassignment meanwhile) take turns.
@@ -145,16 +148,19 @@ class ActivityViewSet(
         if search := params.get('search', '').strip():
             match = (
                 Q(work__customer_name__icontains=search) | Q(description__icontains=search)
-                | Q(assigned_to__name__icontains=search)
+                # By any assignee's name, as a subquery: two matching assignees still make one row.
+                | Q(pk__in=Activity.objects.filter(assignees__name__icontains=search).values('pk'))
             )
             # "12" and "#12" also find Work 12's activities.
             work_id = search.removeprefix('#')
             if re.fullmatch(r'[0-9]{1,18}', work_id):
                 match |= Q(work_id=int(work_id))
             activities = activities.filter(match)
-        for field in ('work', 'assigned_to', 'type', 'status'):
+        for field in ('work', 'type', 'status'):
             if field in params:
                 activities = activities.filter(**{field: params[field]})
+        if 'assigned_to' in params:
+            activities = activities.filter(assignees=params['assigned_to'])
         if 'due_after' in params:
             activities = activities.filter(due_date__gte=params['due_after'])
         if 'due_before' in params:
@@ -184,15 +190,16 @@ class ActivityViewSet(
         notifications.activity_assigned(activity, self.request.user)
 
     def perform_update(self, serializer):
-        """Editing is for admins (ActivityAccess). Whoever it is newly assigned to is told, as are the admins and the
-        assignee when its status changes."""
+        """Editing is for admins (ActivityAccess). Whoever it is newly assigned to is told (not those it already had), as
+        are the admins and the assignees when its status changes."""
         activity, user = serializer.instance, self.request.user
         changes = serializer.validated_data
         status_changes = 'status' in changes and changes['status'] != activity.status
-        assignee_before = activity.assigned_to_id
+        assignees_before = {person.pk for person in activity.assignees.all()}
         activity = serializer.save()
-        if activity.assigned_to_id != assignee_before:
-            notifications.activity_assigned(activity, user)
+        added = [person for person in activity.assignees.all() if person.pk not in assignees_before]
+        if added:
+            notifications.activity_assigned(activity, user, added)
         if status_changes:
             notifications.activity_status_changed(activity, user)
 
