@@ -47,7 +47,7 @@ class CrmResetTests(APITestCase):
         self.assertEqual(set(Role.objects.values_list('name', flat=True)), {'ADMIN', 'STAFF'})
         self.assertEqual(Role.objects.get(name=Role.STAFF).permissions.count(), 2)
         self.assertEqual(Department.objects.get().name, 'Sales')
-        self.assertEqual(SolarPlan.objects.count(), 4)
+        self.assertEqual(SolarPlan.objects.count(), 5)
         # The one notification left is the record of the reset itself, to every admin.
         [notice] = Notification.objects.all()
         self.assertEqual((notice.recipient, notice.kind, notice.title), (self.admin, NotificationKind.CRM_RESET, 'CRM data reset'))

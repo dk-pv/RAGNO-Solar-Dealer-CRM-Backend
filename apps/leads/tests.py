@@ -1,9 +1,11 @@
 import csv
+import importlib
 import io
 from collections import Counter
 from datetime import timedelta
 from decimal import Decimal
 
+from django.apps import apps
 from django.contrib.auth.models import Permission
 from django.core.management import call_command
 from django.core.management.base import CommandError
@@ -96,10 +98,23 @@ class LeadModelTests(TestCase):
         self.assertEqual(Work.objects.count(), 1)
         self.assertEqual(Lead.objects.get(pk=won.pk).status, S.WON)
 
-    def test_every_database_has_the_four_plans_at_their_starting_prices(self):
+    def test_every_database_has_the_five_plans_at_their_starting_prices(self):
         self.assertEqual(
             list(SolarPlan.objects.values_list('name', 'amount', 'is_active')),
-            [('3 kW', 150000, True), ('5 kW', 200000, True), ('8 kW', 245000, True), ('10 kW', 289000, True)],
+            [
+                ('3 kW', 150000, True), ('4 kW', 180000, True), ('5 kW', 200000, True), ('8 kW', 245000, True),
+                ('10 kW', 289000, True),
+            ],
+        )
+
+    def test_rerunning_the_4_kw_migration_keeps_the_plan_and_its_price(self):
+        SolarPlan.objects.filter(capacity=4).update(amount=Decimal('175000'))
+        migration = importlib.import_module('apps.leads.migrations.0006_add_4_kw_plan')
+
+        migration.create_plan(apps, None)
+
+        self.assertEqual(
+            list(SolarPlan.objects.filter(capacity=4).values_list('name', 'amount')), [('4 kW', Decimal('175000'))],
         )
 
     def test_a_plan_price_change_never_alters_the_amount_saved_on_a_lead(self):
@@ -391,8 +406,8 @@ class LeadApiTests(APITestCase):
         self.assertEqual(
             [(plan['name'], plan['amount'], plan['is_active']) for plan in response.data],
             [
-                ('2 kW', '90000.00', False), ('3 kW', '150000.00', True), ('5 kW', '200000.00', True),
-                ('8 kW', '245000.00', True), ('10 kW', '289000.00', True),
+                ('2 kW', '90000.00', False), ('3 kW', '150000.00', True), ('4 kW', '180000.00', True),
+                ('5 kW', '200000.00', True), ('8 kW', '245000.00', True), ('10 kW', '289000.00', True),
             ],
         )
         # Staff need the Leads or the Work module: no module, or Activities alone, isn't enough.
@@ -656,7 +671,7 @@ class SeedDemoLeadsTests(TestCase):
         self.assertEqual(Activity.objects.count(), 14)
         self.assertEqual(
             list(SolarPlan.objects.values_list('name', 'amount')),
-            [('3 kW', 150000), ('5 kW', 200000), ('8 kW', 245000), ('10 kW', 289000)],
+            [('3 kW', 150000), ('4 kW', 180000), ('5 kW', 200000), ('8 kW', 245000), ('10 kW', 289000)],
         )
         self.assertEqual(
             Counter(Lead.objects.values_list('plan__name', flat=True)), {'3 kW': 13, '5 kW': 18, '8 kW': 11, '10 kW': 8},
