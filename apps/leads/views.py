@@ -8,7 +8,6 @@ from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
-from rest_framework.generics import ListAPIView
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import BasePermission
 from rest_framework.response import Response
@@ -271,10 +270,18 @@ class LeadViewSet(
         return Response(list(users.order_by('name', 'id').values('id', 'name')))
 
 
-class SolarPlanListView(ListAPIView):
-    """Every plan with its current price, for the lead and Work forms and filters. Admins manage prices."""
+class SolarPlanViewSet(
+    mixins.ListModelMixin, mixins.CreateModelMixin, mixins.UpdateModelMixin, viewsets.GenericViewSet,
+):
+    """Every plan with its current price, for the lead and Work forms and filters (the Leads or the Work module). Admins
+    manage them in Settings → Solar Plans: add a plan, change its name, capacity or price, deactivate or reactivate it
+    (see SolarPlanSerializer). No delete: leads and Works keep their plan (PROTECT), so a plan is retired by
+    deactivating it."""
 
     queryset = SolarPlan.objects.all()
     serializer_class = SolarPlanSerializer
-    permission_classes = [CanUsePlans]
     pagination_class = None
+    lookup_value_regex = '[0-9]+'
+
+    def get_permissions(self):
+        return [CanUsePlans()] if self.action == 'list' else [IsAdminRole()]

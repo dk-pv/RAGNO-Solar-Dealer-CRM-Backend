@@ -500,7 +500,7 @@ class ActivityVisibilityTests(StaffAccessTestCase):
         rows = {row['id']: row for name in ('activity-list', 'activity-works') for row in self.page(name)['results']}
         flags = ('can_edit', 'can_delete', 'can_open_lead', 'can_update_status')
         self.assertEqual([rows[self.for_b.pk][flag] for flag in flags], [True, True, True, True])
-        self.assertEqual([rows[self.work_unassigned.pk][flag] for flag in flags], [True, False, False, True])
+        self.assertEqual([rows[self.work_unassigned.pk][flag] for flag in flags], [True, True, False, True])
 
 
 class CompletionTests(StaffAccessTestCase):
@@ -784,7 +784,7 @@ class AdminActivityTests(StaffAccessTestCase):
         self.assertEqual(self.client.delete(url).status_code, status.HTTP_204_NO_CONTENT)
         self.assertFalse(Activity.objects.filter(pk=activity.pk).exists())
 
-    def test_an_admin_adds_and_edits_work_activities_which_are_never_deleted(self):
+    def test_an_admin_adds_edits_and_deletes_work_activities(self):
         self.as_user(self.admin)
         body = {'work': self.work.pk, 'type': 'SITE_VISIT', 'description': 'Roof measured.', 'assigned_to': self.staff_b.pk,
                 'status': 'COMPLETED'}
@@ -798,12 +798,9 @@ class AdminActivityTests(StaffAccessTestCase):
         edited = self.patch(activity, description='Roof measured again.', assigned_to=self.staff_a.pk)
         self.assertEqual((edited.status_code, edited.data['description']), (status.HTTP_200_OK, 'Roof measured again.'))
         self.assertEqual(self.assigned_notices(self.staff_a), 1)
-        refused = self.client.delete(reverse('activity-detail', args=[activity.pk]))
-        self.assertEqual(
-            (refused.status_code, refused.data['detail']),
-            (status.HTTP_403_FORBIDDEN, "A Work's activities are kept as its history. Edit the activity instead."),
-        )
-        self.assertTrue(Activity.objects.filter(pk=activity.pk).exists())
+        deleted = self.client.delete(reverse('activity-detail', args=[activity.pk]))
+        self.assertEqual(deleted.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(Activity.objects.filter(pk=activity.pk).exists())
 
     def test_an_admins_lists_are_unaffected_by_the_staff_rules(self):
         self.as_user(self.admin)

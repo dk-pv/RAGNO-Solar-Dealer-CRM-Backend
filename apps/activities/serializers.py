@@ -125,8 +125,8 @@ class ActivitySerializer(AssigneesSerializer, serializers.ModelSerializer):
         return self.context['request'].user.role_id == Role.ADMIN
 
     def get_can_delete(self, activity):
-        # A Work's activities are kept as its history; a lead's follow-up is deleted by an admin.
-        return activity.lead_id is not None and self.get_can_edit(activity) and self.works_the_lead(activity)
+        # Deleting one, a lead's follow-up or a Work's activity, is for admins, as editing is.
+        return self.get_can_edit(activity)
 
     def get_can_open_lead(self, activity):
         # A link to its lead only for someone who can open that page: the Leads module, and the lead theirs.

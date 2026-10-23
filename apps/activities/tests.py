@@ -421,7 +421,7 @@ class LeadAndWorkActivitiesTests(FollowUpTestCase):
         self.assertEqual(
             (row['lead'], row['lead_name'], row['work_summary']['customer_name'], row['can_edit'], row['can_delete'],
              row['can_open_lead']),
-            (None, None, 'Won Lead', True, False, False),
+            (None, None, 'Won Lead', True, True, False),
         )
 
     def test_staff_see_and_complete_their_own_work_activities_without_the_work_module(self):

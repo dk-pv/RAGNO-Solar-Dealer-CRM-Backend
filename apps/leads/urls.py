@@ -1,12 +1,9 @@
-from django.urls import path
 from rest_framework.routers import SimpleRouter
 
-from .views import LeadViewSet, SolarPlanListView
+from .views import LeadViewSet, SolarPlanViewSet
 
 router = SimpleRouter()
 router.register('leads', LeadViewSet, basename='lead')
+router.register('plans', SolarPlanViewSet, basename='plan')
 
-urlpatterns = [
-    path('plans/', SolarPlanListView.as_view(), name='plan-list'),
-    *router.urls,
-]
+urlpatterns = router.urls

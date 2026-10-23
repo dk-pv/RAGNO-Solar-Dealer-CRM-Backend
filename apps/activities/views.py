@@ -1,5 +1,7 @@
+import logging
 import re
 
+from django.db import transaction
 from django.db.models import Case, F, IntegerField, Q, Value, When
 from django.utils import timezone
 from rest_framework import mixins, viewsets
@@ -15,6 +17,8 @@ from apps.notifications import services as notifications
 
 from .models import Activity, ActivityStatus
 from .serializers import ActivityQuerySerializer, ActivitySerializer, CompletionSerializer, WorkActivityQuerySerializer
+
+logger = logging.getLogger(__name__)
 
 NOT_YOUR_ACTIVITY = 'You can only update activities assigned to you.'
 ALREADY_COMPLETED = 'This activity is already completed.'
@@ -204,6 +208,12 @@ class ActivityViewSet(
             notifications.activity_status_changed(activity, user)
 
     def perform_destroy(self, activity):
-        if activity.work_id:
-            raise PermissionDenied("A Work's activities are kept as its history. Edit the activity instead.")
+        """Admins only (ActivityAccess), a lead's follow-up or a Work's activity alike. It is gone for good, with the
+        notifications about it (they cascade); its lead or Work and their other activities stay. Who deleted what goes
+        to the server log, as a Work's deletion does."""
+        record = f'lead {activity.lead_id}' if activity.lead_id else f'Work {activity.work_id}'
+        activity_id = activity.pk
         activity.delete()
+        transaction.on_commit(lambda: logger.warning(
+            'Activity %s (%s) deleted by user %s', activity_id, record, self.request.user.pk,
+        ))

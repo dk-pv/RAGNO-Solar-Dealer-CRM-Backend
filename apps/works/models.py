@@ -1,9 +1,14 @@
 from django.conf import settings
 from django.core.validators import MinValueValidator
 from django.db import models, transaction
+from django.db.models.functions import Coalesce
 
 from . import storage
 from .documents import FILE_DOCUMENTS
+
+# Work.effective_amount in a query, for sums and sorting: the offer price where an admin applied one, otherwise the
+# standard amount.
+EFFECTIVE_AMOUNT = Coalesce('offer_amount', 'amount')
 
 
 class WorkStage(models.TextChoices):
@@ -32,8 +37,14 @@ class Work(models.Model):
     area = models.CharField(max_length=150, blank=True)
     pin_code = models.CharField(max_length=6, blank=True)
     plan = models.ForeignKey('leads.SolarPlan', on_delete=models.PROTECT, related_name='works')
-    # The confirmed price: the lead's amount at conversion. It never follows later plan price changes.
+    # The standard price: the lead's amount at conversion. It never follows later plan price changes, and an offer never
+    # replaces it.
     amount = models.DecimalField(max_digits=12, decimal_places=2, validators=[MinValueValidator(0)])
+    # A special price an admin gave this customer alone (the offer action), or null. What the customer pays is
+    # effective_amount; `amount` stays for reference.
+    offer_amount = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    # Why the offer was given, as the admin noted it (optional).
+    offer_note = models.TextField(blank=True)
     stage = models.CharField(max_length=30, choices=WorkStage.choices, default=WorkStage.LOAN_DOCUMENTS)
     assigned_to = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -53,6 +64,12 @@ class Work(models.Model):
         constraints = [
             models.CheckConstraint(condition=models.Q(stage__in=WorkStage.values), name='works_work_stage_valid'),
             models.CheckConstraint(condition=models.Q(amount__gte=0), name='works_work_amount_non_negative'),
+            # An offer is a price above zero and at most the standard amount: a special price, never a surcharge.
+            models.CheckConstraint(
+                condition=models.Q(offer_amount__isnull=True)
+                | models.Q(offer_amount__gt=0, offer_amount__lte=models.F('amount')),
+                name='works_work_offer_within_amount',
+            ),
         ]
         indexes = [
             models.Index(fields=['stage'], name='works_work_stage_idx'),
@@ -61,6 +78,11 @@ class Work(models.Model):
 
     def __str__(self):
         return f'Work #{self.pk} · {self.customer_name}'
+
+    @property
+    def effective_amount(self):
+        """What the customer pays: the offer price if an admin applied one, otherwise the standard amount."""
+        return self.amount if self.offer_amount is None else self.offer_amount
 
     def delete(self, *args, files=None, **kwargs):
         """With its documents and, once that commits, their files (see WorkDocumentQuerySet.delete for `files`). They

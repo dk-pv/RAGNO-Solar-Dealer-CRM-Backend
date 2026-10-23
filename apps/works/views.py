@@ -24,9 +24,10 @@ from . import storage
 from .documents import (
     ACCEPTED_EXTENSIONS, GROUPS, MAX_FILE_SIZE, REQUIREMENTS, TOO_LARGE, check_file, file_requirement, is_provided,
 )
-from .models import Work, WorkDocument, WorkStage
+from .models import EFFECTIVE_AMOUNT, Work, WorkDocument, WorkStage
 from .serializers import (
-    BulkIdsSerializer, BulkStageSerializer, WorkDocumentSerializer, WorkQuerySerializer, WorkSerializer,
+    BulkIdsSerializer, BulkStageSerializer, OfferSerializer, WorkDocumentSerializer, WorkQuerySerializer,
+    WorkSerializer,
 )
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,7 @@ User = get_user_model()
 DOCUMENT_PATH = r'documents/(?P<key>[a-z_]+)'
 UPLOAD_FAILED = 'Document upload failed. Please try again.'
 FILE_UNAVAILABLE = "The document couldn't be loaded. Please try again."
+OFFER_CHANGED = "Someone else changed this Work's offer meanwhile. Check its amount now and try again."
 
 # Sorting by stage follows the pipeline (Loan Work first, Completed last) rather than the alphabet.
 STAGE_RANK = Case(
@@ -97,7 +99,9 @@ def filter_works(works, query_params):
         works = works.filter(created_at__date__lte=params['created_before'])
 
     ordering = params.get('ordering', '-created_at')
-    field = F('stage_rank' if ordering.lstrip('-') == 'stage' else ordering.lstrip('-'))
+    key = ordering.lstrip('-')
+    # The stage in pipeline order; the amount as the customer pays it (the offer price, where an admin applied one).
+    field = {'stage': F('stage_rank'), 'amount': EFFECTIVE_AMOUNT}.get(key, F(key))
     order = field.desc(nulls_last=True) if ordering.startswith('-') else field.asc(nulls_last=True)
     # Pinned Works come first; the id keeps pages stable when many Works share the sorted value.
     return works.annotate(stage_rank=STAGE_RANK).order_by('-is_pinned', order, '-id')
@@ -126,9 +130,9 @@ class WorkViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.Updat
         return works.annotate(**ACTIVITY_STATS).prefetch_related(documents)
 
     def get_permissions(self):
-        # Deleting Works (with their activity history) or a document is an admin's decision; the Work module covers the
-        # rest, documents included.
-        return [IsAdminRole()] if self.action in ('bulk_delete', 'delete_document') else [CanUseWorks()]
+        # Deleting Works (with their activity history) or a document, and a Work's offer, are an admin's decision; the
+        # Work module covers the rest, documents included.
+        return [IsAdminRole()] if self.action in ('bulk_delete', 'delete_document', 'offer') else [CanUseWorks()]
 
     def set_stage(self, work, stage):
         """Moves the Work and, when it reaches Completed, tells the admins. Called for a PATCH and for the bulk action."""
@@ -177,10 +181,33 @@ class WorkViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.Updat
             ))
         return response
 
+    @action(detail=True, methods=['post'])
+    def offer(self, request, pk=None):
+        """Admins only. Gives this one Work a special price, changes it, or (offer_amount null) removes it: see
+        OfferSerializer. Its standard amount, its plan's price and every other Work stay as they are. Sending the offer
+        the Work already has changes nothing, so a repeated request is harmless."""
+        work = self.get_object()
+        # Locked, so two admins' offers for the same Work take turns and the second is checked against the first.
+        locked = Work.objects.select_for_update().get(pk=work.pk)
+        body = OfferSerializer(data=request.data, context={'work': locked})
+        body.is_valid(raise_exception=True)
+        offer = body.validated_data
+        if (offer['offer_amount'], offer['offer_note']) != (locked.offer_amount, locked.offer_note):
+            if 'expected_offer_amount' in offer and offer['expected_offer_amount'] != locked.offer_amount:
+                return Response({'detail': OFFER_CHANGED}, status=status.HTTP_409_CONFLICT)
+            locked.offer_amount, locked.offer_note = offer['offer_amount'], offer['offer_note']
+            locked.save(update_fields=['offer_amount', 'offer_note', 'updated_at'])
+            # A price decision: who made it goes to the server log, as a Work's deletion does.
+            transaction.on_commit(lambda: logger.warning(
+                'Work %s: offer set to %s by user %s', work.pk, offer['offer_amount'], request.user.pk,
+            ))
+        return Response(self.get_serializer(self.get_object()).data)
+
     @action(detail=False)
     def summary(self, request):
-        """Every stage with its number of Works and their total confirmed amount, for the same search and filters."""
-        rows = self.get_queryset().order_by().values('stage').annotate(count=Count('id'), total=Sum('amount'))
+        """Every stage with its number of Works and their total amount (offer prices where applied), for the same search
+        and filters."""
+        rows = self.get_queryset().order_by().values('stage').annotate(count=Count('id'), total=Sum(EFFECTIVE_AMOUNT))
         totals = {row['stage']: row for row in rows}
         return Response([
             {

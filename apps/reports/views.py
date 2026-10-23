@@ -35,7 +35,7 @@ from apps.dashboard.records import (
 )
 from apps.leads.models import PIPELINE, Lead, LeadSource, LeadStatus
 from apps.leads.views import STATUS_RANK
-from apps.works.models import Work, WorkStage
+from apps.works.models import EFFECTIVE_AMOUNT, Work, WorkStage
 from apps.works.views import STAGE_RANK
 
 from .exports import export
@@ -290,8 +290,8 @@ WORK_ORDERS = {
     '-updated_at': ['-updated_at', '-pk'],
     'customer_name': ['customer_name', 'pk'],
     'stage': [STAGE_RANK, '-created_at', '-pk'],
-    '-amount': ['-amount', '-pk'],
-    'amount': ['amount', 'pk'],
+    '-amount': [EFFECTIVE_AMOUNT.desc(), '-pk'],
+    'amount': [EFFECTIVE_AMOUNT.asc(), 'pk'],
 }
 
 
@@ -321,12 +321,16 @@ class WorkSummaryView(SummaryView):
         works = work_records(user, params)
         completed = Q(stage=WorkStage.COMPLETED)
         totals = works.aggregate(
-            created=Count('pk'), value=Sum('amount'), completed=Count('pk', filter=completed),
-            completed_value=Sum('amount', filter=completed),
+            created=Count('pk'), value=Sum(EFFECTIVE_AMOUNT), completed=Count('pk', filter=completed),
+            completed_value=Sum(EFFECTIVE_AMOUNT, filter=completed),
         )
-        by_stage = {row['stage']: row for row in works.order_by().values('stage').annotate(count=Count('pk'), value=Sum('amount'))}
+        by_stage = {
+            row['stage']: row
+            for row in works.order_by().values('stage').annotate(count=Count('pk'), value=Sum(EFFECTIVE_AMOUNT))
+        }
         return {
-            # Amounts are each Work's confirmed amount, fixed at conversion: later plan price changes never alter them.
+            # Amounts are what each customer pays: the Work's amount fixed at conversion (later plan price changes never
+            # alter it), or the offer price an admin gave that Work.
             'totals': {
                 'created': totals['created'], 'amount': money(totals['value']),
                 'completed': totals['completed'], 'completed_amount': money(totals['completed_value']),
@@ -338,10 +342,12 @@ class WorkSummaryView(SummaryView):
             ],
             'by_staff': [
                 {**row, 'amount': money(row.pop('value'))}
-                for row in by_user(works, 'assigned_to', value=Sum('amount'), completed=Count('pk', filter=completed))
+                for row in by_user(
+                    works, 'assigned_to', value=Sum(EFFECTIVE_AMOUNT), completed=Count('pk', filter=completed),
+                )
             ],
             # Each point: the Works created and their confirmed value (created_value).
-            'trend': trend(params, created=(works, 'created_at', {'value': Sum('amount')})),
+            'trend': trend(params, created=(works, 'created_at', {'value': Sum(EFFECTIVE_AMOUNT)})),
         }
 
 
@@ -355,7 +361,8 @@ class WorkReportView(RowsView):
         ('Stage', lambda work: work.get_stage_display()),
         ('Assigned to', lambda work: name(work.assigned_to) or 'Unassigned'),
         ('Plan', lambda work: work.plan.name),
-        ('Confirmed amount', lambda work: work.amount),
+        ('Confirmed amount', lambda work: work.effective_amount),
+        ('Offer applied', lambda work: 'No' if work.offer_amount is None else 'Yes'),
         ('Due date', lambda work: work.due_date),
         ('Created (converted)', lambda work: work.created_at),
         ('Last updated', lambda work: work.updated_at),
@@ -370,7 +377,8 @@ class WorkReportView(RowsView):
         return {
             'id': work.pk, 'lead': work.lead_id, 'customer_name': work.customer_name, 'stage': work.stage,
             'stage_display': work.get_stage_display(), 'assigned_to': work.assigned_to_id,
-            'assigned_to_name': name(work.assigned_to), 'plan_name': work.plan.name, 'amount': money(work.amount),
+            'assigned_to_name': name(work.assigned_to), 'plan_name': work.plan.name,
+            'amount': money(work.effective_amount), 'offer_applied': work.offer_amount is not None,
             'due_date': work.due_date, 'created_at': work.created_at, 'updated_at': work.updated_at,
             'latest_activity': latest_activity(work),
         }

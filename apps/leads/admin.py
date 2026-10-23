@@ -3,7 +3,7 @@ from django.contrib import admin
 from .models import Lead, SolarPlan
 
 
-# Until the CRM's Settings screen exists, admins keep plan prices up to date here.
+# Admins manage plans in the CRM (Settings → Solar Plans), which validates them; this is the Django admin's view.
 @admin.register(SolarPlan)
 class SolarPlanAdmin(admin.ModelAdmin):
     list_display = ['name', 'capacity', 'amount', 'is_active']

@@ -16,9 +16,45 @@ ORDERINGS = ['name', 'created_at', 'status', 'amount', 'next_follow_up', 'plan__
 
 
 class SolarPlanSerializer(serializers.ModelSerializer):
+    """A plan as the forms list it and admins manage it (Settings → Solar Plans). `amount` is its default price for new
+    leads only: changing it never touches the amount a lead or Work already has. Deactivating it keeps it on the leads
+    and Works that have it, but it can't be chosen for a lead again until it is reactivated."""
+
+    # Declared, so duplicates are refused in the CRM's words (a name in any case) rather than the model's.
+    name = serializers.CharField(max_length=50)
+    capacity = serializers.DecimalField(max_digits=5, decimal_places=2)
+    amount = serializers.DecimalField(max_digits=12, decimal_places=2)
+
     class Meta:
         model = SolarPlan
         fields = ['id', 'name', 'capacity', 'amount', 'is_active']
+
+    def others(self):
+        return SolarPlan.objects.exclude(pk=getattr(self.instance, 'pk', None))
+
+    def validate_name(self, value):
+        if self.others().filter(name__iexact=value).exists():
+            raise serializers.ValidationError('A plan with this name already exists.')
+        return value
+
+    def validate_capacity(self, value):
+        if value <= 0:
+            raise serializers.ValidationError('Enter a capacity greater than zero.')
+        if self.others().filter(capacity=value).exists():
+            raise serializers.ValidationError('A plan with this capacity already exists.')
+        # The size is part of every lead's and Work's record of the plan, so it changes only while none uses it.
+        plan = self.instance
+        if plan and value != plan.capacity and (plan.leads.exists() or plan.works.exists()):
+            raise serializers.ValidationError(
+                "Leads or Works already use this plan, so its capacity can't change. Add a plan for the new capacity, "
+                "and deactivate this one if it is no longer sold."
+            )
+        return value
+
+    def validate_amount(self, value):
+        if value <= 0:
+            raise serializers.ValidationError('Enter a price greater than zero.')
+        return value
 
 
 class LeadSerializer(AssigneesSerializer, serializers.ModelSerializer):

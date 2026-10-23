@@ -303,7 +303,7 @@ class WorkActivityTests(WorkTestCase):
         self.assertEqual(self.add(lead=lead.pk).status_code, status.HTTP_403_FORBIDDEN)
         self.assertEqual(Activity.objects.count(), 1)
 
-    def test_activities_belong_to_one_work_for_good_and_are_never_deleted(self):
+    def test_activities_belong_to_one_work_for_good_until_an_admin_deletes_them(self):
         other = convert_lead(self.plan, self.admin, phone='9876500002')
         inactive = User.objects.create_user(email='left@example.com', password=PASSWORD, name='Left', is_active=False)
         self.client.force_authenticate(self.admin)
@@ -311,12 +311,15 @@ class WorkActivityTests(WorkTestCase):
         url = reverse('activity-detail', args=[activity])
 
         self.assertEqual(self.client.patch(url, {'work': other.pk}, format='json').status_code, 400)
-        self.assertEqual(self.client.delete(url).status_code, status.HTTP_403_FORBIDDEN)
         self.assertIn('assigned_to', self.add(assigned_to=inactive.pk).data)
         missing = self.client.post(reverse('activity-list'), {'type': 'NOTE', 'description': 'x'}, format='json')
         self.assertEqual(missing.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(self.client.get(reverse('activity-list'), {'work': 'x'}).status_code, 400)
         self.assertEqual(self.listed(), [('Site feasibility follow-up.', 'PENDING')])
+        # Deleting one is an admin's: it goes for good, and the Work stays.
+        self.assertEqual(self.client.delete(url).status_code, status.HTTP_204_NO_CONTENT)
+        self.assertEqual(self.listed(), [])
+        self.assertTrue(Work.objects.filter(pk=self.work.pk).exists())
 
 
 class WorkActivitiesPageTests(WorkTestCase):
