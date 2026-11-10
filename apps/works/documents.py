@@ -45,6 +45,18 @@ REQUIREMENTS = [
 # The documents uploaded as files: the choices of WorkDocument.document_key.
 FILE_DOCUMENTS = [(requirement.key, requirement.name) for requirement in REQUIREMENTS if not requirement.field]
 
+# Any other file for the Work, uploaded with a title of its own (any number per Work): stored under this key, never one of
+# the requirements', so it is never counted as one of them.
+ADDITIONAL = 'additional'
+ADDITIONAL_CATEGORIES = [
+    ('BANK', 'Bank document'),
+    ('AGREEMENT', 'Customer agreement'),
+    ('SITE_PHOTO', 'Site photograph'),
+    ('QUOTATION', 'Quotation'),
+    ('INVOICE', 'Invoice'),
+    ('OTHER', 'Other supporting document'),
+]
+
 # What a document file may be. The type is recognised from how the file's contents start, never from the type the
 # browser claims, and the file's name must end in one of that type's extensions.
 FILE_TYPES = [
@@ -83,7 +95,8 @@ def summarize(work):
 
 
 def file_requirement(key):
-    """The document uploaded as a file under `key`. Any other key, Email ID and Phone number included, is not found."""
+    """The document uploaded as a file under `key`. Any other key, Email ID, Phone number and the additional documents'
+    included, is not found."""
     requirement = next((requirement for requirement in REQUIREMENTS if requirement.key == key), None)
     if requirement is None or requirement.field:
         raise NotFound('There is no such document.')

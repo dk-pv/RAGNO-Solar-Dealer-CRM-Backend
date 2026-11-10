@@ -24,7 +24,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.activities.models import Activity, ActivityStatus
-from apps.leads.models import PIPELINE, LeadStatus
+from apps.leads.models import OUTCOMES, LeadStatus, Pipeline, stage_choices
 from apps.works.models import WorkStage
 
 from .records import (
@@ -42,7 +42,7 @@ class CanOpenDashboard(BasePermission):
 
 def scheduled_lead_follow_ups(leads):
     """Open leads with a follow-up date scheduled. Won and Lost leads need no more follow-ups."""
-    return leads.filter(status__in=PIPELINE, next_follow_up__isnull=False)
+    return leads.exclude(status__in=OUTCOMES).filter(next_follow_up__isnull=False)
 
 
 def due_filter(field, bucket, today):
@@ -89,13 +89,14 @@ class SummaryView(APIView):
         if leads is not None:
             data['leads'] = leads.aggregate(
                 total=Count('pk'),
-                active=Count('pk', filter=Q(status__in=PIPELINE)),
+                active=Count('pk', filter=~Q(status__in=OUTCOMES)),
                 confirmed=Count('pk', filter=Q(status=LeadStatus.WON)),
                 lost=Count('pk', filter=Q(status=LeadStatus.LOST)),
             )
             by_status = dict(leads.order_by().values_list('status').annotate(Count('pk')))
             data['leads']['by_status'] = [
-                {'status': status, 'label': label, 'count': by_status.get(status, 0)} for status, label in LeadStatus.choices
+                {'status': status, 'label': label, 'count': by_status.get(status, 0)}
+                for status, label in stage_choices(Pipeline.LEAD)
             ]
         if works is not None:
             data['works'] = works.aggregate(
@@ -105,7 +106,7 @@ class SummaryView(APIView):
             )
         data['follow_ups'] = follow_up_counts(user, leads, works, today)
         data['mine'] = {
-            'leads': None if leads is None else leads.filter(assignees=user, status__in=PIPELINE).count(),
+            'leads': None if leads is None else leads.filter(assignees=user).exclude(status__in=OUTCOMES).count(),
             'works': None if works is None else works.filter(assigned_to=user).exclude(stage=WorkStage.COMPLETED).count(),
             'follow_ups': follow_up_counts(user, leads, works, today, mine=True),
         }

@@ -161,7 +161,11 @@ class RequirementTests(SimpleTestCase):
 
         self.assertEqual(fields, {'email_id': 'email', 'phone_number': 'phone'})
         self.assertEqual(documents.FILE_DOCUMENTS, list(zip(FILE_KEYS, FILE_NAMES)))
-        self.assertEqual(WorkDocument._meta.get_field('document_key').choices, documents.FILE_DOCUMENTS)
+        # Every file document's key, and the one the additional documents share.
+        self.assertEqual(
+            WorkDocument._meta.get_field('document_key').choices,
+            [*documents.FILE_DOCUMENTS, (documents.ADDITIONAL, 'Additional document')],
+        )
 
     def test_keys_are_url_safe_identifiers_and_never_the_display_names(self):
         for requirement in documents.REQUIREMENTS:

@@ -13,7 +13,7 @@ from django.db.models.functions import Cast
 
 from apps.accounts.models import by_name
 from apps.activities.models import Activity, ActivityType
-from apps.leads.models import Lead
+from apps.leads.models import Lead, stage_name_of
 from apps.works.models import Work
 
 User = get_user_model()
@@ -45,11 +45,13 @@ def names(users):
 
 
 def with_latest_activity(records, field):
-    """Each record with its newest activity's type and time, in the same query (None when it has no activity)."""
+    """Each record with its newest activity's type and time, in the same query (None when it has no activity), and its
+    stage's current name (get_status_display / get_stage_display read it)."""
     latest = Activity.objects.filter(**{field: OuterRef('pk')}).order_by('-created_at', '-pk')
     return records.annotate(
         latest_activity_type=Subquery(latest.values('type')[:1]),
         latest_activity_at=Subquery(latest.values('created_at')[:1]),
+        stage_label=stage_name_of('status' if field == 'lead' else 'stage'),
     )
 
 

@@ -1,10 +1,9 @@
 import logging
 import re
-from decimal import Decimal
 
 from django.contrib.auth import get_user_model
 from django.db import transaction
-from django.db.models import Case, Count, F, IntegerField, Min, Prefetch, Q, Sum, Value, When
+from django.db.models import Count, F, Min, Prefetch, Q, Sum
 from django.db.models.functions import Concat
 from django.http import FileResponse
 from rest_framework import mixins, status, viewsets
@@ -17,17 +16,19 @@ from rest_framework.response import Response
 
 from apps.accounts.permissions import IsAdminRole
 from apps.activities.models import ActivityStatus
-from apps.leads.views import bulk_apply
+from apps.leads.models import Pipeline, lock_stage, stage_rank
+from apps.leads.views import bulk_apply, stage_summary
 from apps.notifications import services as notifications
 
 from . import storage
 from .documents import (
-    ACCEPTED_EXTENSIONS, GROUPS, MAX_FILE_SIZE, REQUIREMENTS, TOO_LARGE, check_file, file_requirement, is_provided,
+    ACCEPTED_EXTENSIONS, ADDITIONAL, ADDITIONAL_CATEGORIES, GROUPS, MAX_FILE_SIZE, REQUIREMENTS, TOO_LARGE, check_file,
+    file_requirement, is_provided,
 )
 from .models import EFFECTIVE_AMOUNT, Work, WorkDocument, WorkStage
 from .serializers import (
-    BulkIdsSerializer, BulkStageSerializer, OfferSerializer, WorkDocumentSerializer, WorkQuerySerializer,
-    WorkSerializer,
+    AdditionalDocumentSerializer, AdditionalUploadSerializer, BulkIdsSerializer, BulkStageSerializer, OfferSerializer,
+    WorkDocumentSerializer, WorkQuerySerializer, WorkSerializer,
 )
 
 logger = logging.getLogger(__name__)
@@ -37,15 +38,15 @@ User = get_user_model()
 # A document in a Work's URLs: /works/{id}/documents/{key}/. The key, never an id, so a document is only ever reached
 # through its own Work.
 DOCUMENT_PATH = r'documents/(?P<key>[a-z_]+)'
+# An additional document: /works/{id}/additional-documents/{document id}/, looked up within that Work only.
+ADDITIONAL_PATH = r'additional-documents/(?P<document_id>[0-9]+)'
 UPLOAD_FAILED = 'Document upload failed. Please try again.'
 FILE_UNAVAILABLE = "The document couldn't be loaded. Please try again."
 OFFER_CHANGED = "Someone else changed this Work's offer meanwhile. Check its amount now and try again."
 
-# Sorting by stage follows the pipeline (Loan Work first, Completed last) rather than the alphabet.
-STAGE_RANK = Case(
-    *(When(stage=value, then=Value(rank)) for rank, value in enumerate(WorkStage.values)),
-    output_field=IntegerField(),
-)
+# Sorting by stage follows the pipeline as the board shows it (Loan Work first, an admin's stages where they put them,
+# Completed last) rather than the alphabet.
+STAGE_RANK = stage_rank('stage')
 
 _pending = Q(activities__status=ActivityStatus.PENDING)
 # Each Work's activities in brief, in the same query as the Works: no request per card.
@@ -92,6 +93,8 @@ def filter_works(works, query_params):
     for field in ('stage', 'assigned_to', 'plan'):
         if field in params:
             works = works.filter(**{field: params[field]})
+    if 'work_type' in params:
+        works = works.filter(work_type='' if params['work_type'] == 'none' else params['work_type'])
     # Calendar days in the CRM's time zone (Asia/Kolkata), both ends included.
     if 'created_after' in params:
         works = works.filter(created_at__date__gte=params['created_after'])
@@ -130,12 +133,15 @@ class WorkViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.Updat
         return works.annotate(**ACTIVITY_STATS).prefetch_related(documents)
 
     def get_permissions(self):
-        # Deleting Works (with their activity history) or a document, and a Work's offer, are an admin's decision; the
-        # Work module covers the rest, documents included.
-        return [IsAdminRole()] if self.action in ('bulk_delete', 'delete_document', 'offer') else [CanUseWorks()]
+        # Deleting Works (with their activity history) or a document (required or additional), and a Work's offer, are an
+        # admin's decision; the Work module covers the rest, documents included.
+        admin_only = ('bulk_delete', 'delete_document', 'delete_additional_document', 'offer')
+        return [IsAdminRole()] if self.action in admin_only else [CanUseWorks()]
 
     def set_stage(self, work, stage):
-        """Moves the Work and, when it reaches Completed, tells the admins. Called for a PATCH and for the bulk action."""
+        """Moves the Work and, when it reaches Completed, tells the admins. Called for the bulk action, each Work in its
+        own savepoint: a stage deleted meanwhile refuses each Work (LeadConflict)."""
+        lock_stage(Pipeline.WORK, stage)
         was_completed = work.stage == WorkStage.COMPLETED
         if work.stage != stage:
             work.stage = stage
@@ -145,6 +151,9 @@ class WorkViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.Updat
 
     def perform_update(self, serializer):
         before = serializer.instance.stage
+        if 'stage' in serializer.validated_data:
+            # Kept until the request commits, so it can't be deleted while this Work moves in (see lock_stage).
+            lock_stage(Pipeline.WORK, serializer.validated_data['stage'])
         work = serializer.save()
         if work.stage == WorkStage.COMPLETED and before != WorkStage.COMPLETED:
             notifications.work_completed(work, self.request.user)
@@ -209,16 +218,7 @@ class WorkViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.Updat
         and filters."""
         rows = self.get_queryset().order_by().values('stage').annotate(count=Count('id'), total=Sum(EFFECTIVE_AMOUNT))
         totals = {row['stage']: row for row in rows}
-        return Response([
-            {
-                'stage': stage,
-                'label': label,
-                'count': totals.get(stage, {}).get('count', 0),
-                # Money is a two-decimal string, as the Work's own amount is, whatever the database returns for a sum.
-                'total_amount': str((totals.get(stage, {}).get('total') or Decimal(0)).quantize(Decimal('0.01'))),
-            }
-            for stage, label in WorkStage.choices
-        ])
+        return Response(stage_summary(Pipeline.WORK, totals, 'stage'))
 
     @action(detail=False)
     def assignees(self, request):
@@ -231,7 +231,8 @@ class WorkViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.Updat
     def document_checklist(self, work):
         """The Documents page: the Work (with its document_summary) and every required document, in groups, uploaded or
         not."""
-        uploaded = {document.document_key: document for document in work.documents.all()}
+        documents = list(work.documents.all())
+        uploaded = {document.document_key: document for document in documents if document.document_key != ADDITIONAL}
 
         def item(requirement):
             document = uploaded.get(requirement.key)
@@ -253,6 +254,16 @@ class WorkViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.Updat
                 {'key': group, 'label': label, 'items': [item(r) for r in REQUIREMENTS if r.group == group]}
                 for group, label in GROUPS
             ],
+            # Apart from the checklist and never counted in it: the newest first.
+            'additional': AdditionalDocumentSerializer(
+                sorted(
+                    (document for document in documents if document.document_key == ADDITIONAL),
+                    key=lambda document: (document.created_at, document.pk), reverse=True,
+                ),
+                many=True,
+            ).data,
+            'additional_categories': [{'value': value, 'label': label} for value, label in ADDITIONAL_CATEGORIES],
+            'accept': ACCEPTED_EXTENSIONS,
             'max_file_size': MAX_FILE_SIZE,
             'can_delete': IsAdminRole().has_permission(self.request, self),
         }
@@ -307,6 +318,8 @@ class WorkViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.Updat
     def delete_document(self, request, pk=None, key=None):
         """Admins only. Deletes a document: its record now, its file once that commits."""
         work = self.get_object()
+        # A required document's key only: never all the additional ones at once.
+        file_requirement(key)
         # Locked first, as an upload locks it, so the record deleted is the one there once a running upload is done.
         Work.objects.select_for_update().get(pk=work.pk)
         if not work.documents.filter(document_key=key).delete()[0]:
@@ -320,14 +333,80 @@ class WorkViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.Updat
     def document_file(self, request, pk=None, key=None):
         """The document's file, passed on from Cloudinary to someone who may open the Work: the browser never learns
         where it is kept, and nothing is cached."""
-        document = self.get_object().documents.filter(document_key=key).first()
+        work = self.get_object()
+        file_requirement(key)  # an additional document is reached by its own id (additional_document_file)
+        document = work.documents.filter(document_key=key).first()
         if document is None:
             raise NotFound('This document has not been uploaded.')
+        return self.send_file(document, key)
+
+    def send_file(self, document, label):
         try:
             stored = storage.fetch(document.cloudinary_public_id, document.cloudinary_resource_type)
         except storage.StorageError as error:
-            logger.error('Work %s: fetching the %s document failed: %s', document.work_id, key, error)
+            logger.error('Work %s: fetching the %s document failed: %s', document.work_id, label, error)
             return Response({'detail': FILE_UNAVAILABLE}, status=status.HTTP_502_BAD_GATEWAY)
         response = FileResponse(stored, content_type=document.content_type, filename=document.original_filename)
         response['Cache-Control'] = 'private, no-store'
         return response
+
+    # Additional documents: any number per Work, each with a title, apart from the required checklist and never counted
+    # in it. The same storage, file checks and access rules as the required documents.
+
+    def additional_document(self, work, document_id):
+        """One of this Work's additional documents: never one of another Work's, nor a required document."""
+        document = work.documents.filter(pk=document_id, document_key=ADDITIONAL).select_related('uploaded_by').first()
+        if document is None:
+            raise NotFound('There is no such document.')
+        return document
+
+    @action(detail=True, methods=['post'], url_path='additional-documents', parser_classes=[MultiPartParser])
+    def upload_additional_document(self, request, pk=None):
+        """Uploads an additional document (multipart: `file`, `title`, optional `category` and `description`). The
+        details are checked before the file is stored. Answers the updated checklist."""
+        work = self.get_object()
+        length = request.META.get('CONTENT_LENGTH') or ''
+        if length.isdigit() and int(length) > MAX_FILE_SIZE + 64 * 1024:
+            raise ValidationError({'file': [TOO_LARGE]})
+        details = AdditionalUploadSerializer(data=request.data)
+        details.is_valid(raise_exception=True)
+        upload = request.FILES.get('file')
+        content_type, extension = check_file(upload)
+        content = upload.read()
+
+        try:
+            public_id = storage.upload(content, f'ragno/works/{work.pk}/{ADDITIONAL}', extension)
+        except storage.StorageError as error:
+            logger.error('Work %s: uploading an additional document failed: %s', work.pk, error)
+            return Response({'detail': UPLOAD_FAILED}, status=status.HTTP_502_BAD_GATEWAY)
+        try:
+            with transaction.atomic():
+                WorkDocument.save_additional(
+                    work, request.user, **details.validated_data, public_id=public_id,
+                    resource_type=storage.RESOURCE_TYPE, filename=upload.name, content_type=content_type,
+                    size=len(content),
+                )
+        except Exception:
+            # Not recorded, so nothing points at the new file.
+            storage.delete([(storage.RESOURCE_TYPE, public_id)])
+            raise
+        return Response(self.document_checklist(self.get_object()), status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['delete'], url_path=ADDITIONAL_PATH)
+    def delete_additional_document(self, request, pk=None, document_id=None):
+        """Admins only. Deletes an additional document: its record now, its file once that commits."""
+        work = self.get_object()
+        # Locked first, as an upload locks it.
+        Work.objects.select_for_update().get(pk=work.pk)
+        document = self.additional_document(work, document_id)
+        WorkDocument.objects.filter(pk=document.pk).delete()
+        transaction.on_commit(lambda: logger.warning(
+            'Work %s: additional document %s ("%s") deleted by user %s', work.pk, document_id, document.title,
+            request.user.pk,
+        ))
+        return Response(self.document_checklist(self.get_object()))
+
+    @action(detail=True, url_path=f'{ADDITIONAL_PATH}/file')
+    def additional_document_file(self, request, pk=None, document_id=None):
+        """An additional document's file, as document_file sends a required one's."""
+        return self.send_file(self.additional_document(self.get_object(), document_id), f'additional {document_id}')

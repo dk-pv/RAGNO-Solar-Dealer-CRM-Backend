@@ -33,10 +33,14 @@ from apps.activities.models import Activity, ActivityStatus, ActivityType
 from apps.dashboard.records import (
     EVENT_KINDS, EVENT_RECORDS, describe_events, event_feed, latest_activity, name, names, visible, with_latest_activity,
 )
-from apps.leads.models import PIPELINE, Lead, LeadSource, LeadStatus
+from apps.leads.models import OUTCOMES, Lead, LeadSource, LeadStatus, Pipeline, stage_choices
+from apps.leads.serializers import StageField
 from apps.leads.views import STATUS_RANK
 from apps.works.models import EFFECTIVE_AMOUNT, Work, WorkStage
 from apps.works.views import STAGE_RANK
+
+# A lead still in the pipeline: in any stage but Won or Lost, an admin's stages included.
+OPEN_LEAD = ~Q(status__in=OUTCOMES)
 
 from .exports import export
 
@@ -210,7 +214,7 @@ LEAD_ORDERS = {
 
 
 class LeadQuery(PeriodQuery):
-    status = serializers.ChoiceField(choices=LeadStatus.choices, required=False)
+    status = StageField(Pipeline.LEAD, required=False)
     assigned_to = AssigneeField(required=False)
     source = serializers.ChoiceField(choices=[*LeadSource.values, 'none'], required=False)
     ordering = serializers.ChoiceField(choices=list(LEAD_ORDERS), required=False)
@@ -239,14 +243,14 @@ class LeadSummaryView(SummaryView):
         return {
             'totals': leads.aggregate(
                 created=Count('pk'),
-                open=Count('pk', filter=Q(status__in=PIPELINE)),
+                open=Count('pk', filter=OPEN_LEAD),
                 confirmed=Count('pk', filter=Q(status=LeadStatus.WON)),
                 lost=Count('pk', filter=Q(status=LeadStatus.LOST)),
             ),
-            'by_status': choice_counts(leads, 'status', LeadStatus.choices),
+            'by_status': choice_counts(leads, 'status', stage_choices(Pipeline.LEAD)),
             'by_source': choice_counts(leads, 'source', LeadSource.choices, empty_label='Not set'),
             'by_staff': by_user(
-                leads, open=Count('pk', filter=Q(status__in=PIPELINE)), confirmed=Count('pk', filter=Q(status=LeadStatus.WON)),
+                leads, open=Count('pk', filter=OPEN_LEAD), confirmed=Count('pk', filter=Q(status=LeadStatus.WON)),
             ),
             'trend': trend(params, created=(leads, 'created_at', {})),
         }
@@ -296,7 +300,7 @@ WORK_ORDERS = {
 
 
 class WorkQuery(PeriodQuery):
-    stage = serializers.ChoiceField(choices=WorkStage.choices, required=False)
+    stage = StageField(Pipeline.WORK, required=False)
     assigned_to = AssigneeField(required=False)
     ordering = serializers.ChoiceField(choices=list(WORK_ORDERS), required=False)
 
@@ -338,7 +342,7 @@ class WorkSummaryView(SummaryView):
             'by_stage': [
                 {'value': stage, 'label': label, 'count': by_stage.get(stage, {}).get('count', 0),
                  'amount': money(by_stage.get(stage, {}).get('value'))}
-                for stage, label in WorkStage.choices
+                for stage, label in stage_choices(Pipeline.WORK)
             ],
             'by_staff': [
                 {**row, 'amount': money(row.pop('value'))}

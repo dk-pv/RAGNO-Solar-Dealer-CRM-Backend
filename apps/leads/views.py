@@ -1,26 +1,37 @@
 import csv
+import logging
+import uuid
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
-from django.db import transaction
-from django.db.models import Case, Count, F, IntegerField, OuterRef, ProtectedError, Subquery, Sum, Value, When
+from django.db import IntegrityError, transaction
+from django.db.models import Count, F, OuterRef, ProtectedError, Q, Subquery, Sum
+from django.db.models.functions import Coalesce
 from django.http import HttpResponse
 from django.utils import timezone
-from rest_framework import mixins, status, viewsets
+from rest_framework import mixins, serializers, status, viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 from rest_framework.pagination import PageNumberPagination
-from rest_framework.permissions import BasePermission
+from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.response import Response
 
 from apps.accounts.models import Role, by_name
 from apps.accounts.permissions import IsAdminRole, ModelPermissions
 from apps.notifications import services as notifications
 
-from .models import Lead, LeadConflict, LeadStatus, SolarPlan
-from .serializers import (
-    BulkIdsSerializer, BulkStatusSerializer, LeadQuerySerializer, LeadSerializer, SolarPlanSerializer,
-    StatusChangeSerializer,
+from apps.works.models import Work
+
+from .models import (
+    FIRST_STAGE, LAST_STAGES, Lead, LeadConflict, Pipeline, PipelineStage, SolarPlan, stage_choices, stage_name_of,
+    stage_rank,
 )
+from .serializers import (
+    BulkIdsSerializer, BulkStatusSerializer, LeadQuerySerializer, LeadSerializer, PipelineStageSerializer,
+    SolarPlanSerializer, StatusChangeSerializer,
+)
+
+logger = logging.getLogger(__name__)
 
 PROTECTED_LEAD = "This lead has records that depend on it, such as its Work, so it can't be deleted."
 MISSING_RECORD = "This record no longer exists, or you don't have access to it."
@@ -53,11 +64,9 @@ def bulk_apply(records, ids, apply, label=str):
 
 User = get_user_model()
 
-# Sorting by status follows the pipeline (New first, Lost last) rather than the alphabet.
-STATUS_RANK = Case(
-    *(When(status=value, then=Value(rank)) for rank, value in enumerate(LeadStatus.values)),
-    output_field=IntegerField(),
-)
+# Sorting by status follows the pipeline as the board shows it (New first, an admin's stages where they put them, Won and
+# Lost last) rather than the alphabet.
+STATUS_RANK = stage_rank('status')
 # Sorting by assignee: by the first one's name, as a subquery, so a lead with several assignees is still one row.
 FIRST_ASSIGNEE_NAME = Subquery(
     User.objects.filter(assigned_leads=OuterRef('pk')).order_by('name', 'pk').values('name')[:1],
@@ -76,6 +85,8 @@ def filter_leads(leads, query_params):
             leads = leads.filter(**{field: params[field]})
     if 'plan' in params:
         leads = leads.filter(plan_id=params['plan'])
+    if 'work_type' in params:
+        leads = leads.filter(work_type='' if params['work_type'] == 'none' else params['work_type'])
     # The leads this user is one of the assignees of (one row per lead).
     if 'assigned_to' in params:
         leads = leads.filter(assignees=params['assigned_to'])
@@ -99,6 +110,21 @@ def csv_cell(value):
     """Text starting with = + - @ is kept as text rather than run as a formula when a spreadsheet opens the file."""
     text = str(value)
     return f"'{text}" if text[:1] in ('=', '+', '-', '@', '\t', '\r') else text
+
+
+def stage_summary(pipeline, totals, field):
+    """Every stage of the pipeline in the board's order, with its number of records and their total amount: the board's
+    column headers. `totals` maps a stage's key to {'count', 'total'}; `field` names the key ('status' or 'stage')."""
+    return [
+        {
+            field: key,
+            'label': name,
+            'count': totals.get(key, {}).get('count', 0),
+            # Money is a two-decimal string, as a record's own amount is, whatever the database returns for a sum.
+            'total_amount': str((totals.get(key, {}).get('total') or Decimal(0)).quantize(Decimal('0.01'))),
+        }
+        for key, name in stage_choices(pipeline)
+    ]
 
 
 class CanViewLeads(BasePermission):
@@ -172,16 +198,7 @@ class LeadViewSet(
         Lead Pipeline's columns show, as the Works summary does for its stages. Staff get their own leads' numbers."""
         rows = self.get_queryset().order_by().values('status').annotate(count=Count('id'), total=Sum('amount'))
         totals = {row['status']: row for row in rows}
-        return Response([
-            {
-                'status': value,
-                'label': label,
-                'count': totals.get(value, {}).get('count', 0),
-                # Money is a two-decimal string, as the lead's own amount is, whatever the database returns for a sum.
-                'total_amount': str((totals.get(value, {}).get('total') or Decimal(0)).quantize(Decimal('0.01'))),
-            }
-            for value, label in LeadStatus.choices
-        ])
+        return Response(stage_summary(Pipeline.LEAD, totals, 'status'))
 
     def perform_create(self, serializer):
         user = self.request.user
@@ -248,13 +265,13 @@ class LeadViewSet(
         writer = csv.writer(response)
         writer.writerow([
             'Lead ID', 'Customer', 'Country code', 'Phone', 'Email', 'Area', 'District', 'State', 'PIN code',
-            'Dealer', 'Plan', 'Amount', 'Status', 'Source', 'Assigned to', 'Next follow-up', 'Created',
+            'Dealer', 'Plan', 'Amount', 'Work type', 'Status', 'Source', 'Assigned to', 'Next follow-up', 'Created',
         ])
-        for lead in self.get_queryset():
+        for lead in self.get_queryset().annotate(stage_label=stage_name_of('status')):
             writer.writerow([csv_cell(value) for value in (
                 lead.id, lead.name, lead.country_code, lead.phone, lead.email, lead.area, lead.district, lead.state,
                 lead.pin_code, lead.dealer_name, lead.plan.name if lead.plan else '', '' if lead.amount is None else lead.amount,
-                lead.get_status_display(), lead.get_source_display(),
+                lead.get_work_type_display(), lead.get_status_display(), lead.get_source_display(),
                 ', '.join(user.name for user in by_name(lead.assignees.all())), lead.next_follow_up or '',
                 timezone.localtime(lead.created_at).strftime('%Y-%m-%d %H:%M'),
             )])
@@ -285,3 +302,152 @@ class SolarPlanViewSet(
 
     def get_permissions(self):
         return [CanUsePlans()] if self.action == 'list' else [IsAdminRole()]
+
+
+def records_in(stage):
+    """The leads or the Works in a stage."""
+    return Lead.objects.filter(status=stage.key) if stage.pipeline == Pipeline.LEAD else Work.objects.filter(stage=stage.key)
+
+
+def _count_in(model, field):
+    return Coalesce(
+        Subquery(model.objects.filter(**{field: OuterRef('key')}).order_by().values(field).annotate(n=Count('pk')).values('n')),
+        0,
+    )
+
+
+# The leads or Works in each stage. A key is never both a lead status and a Work stage, so one of the two is always 0.
+RECORD_COUNT = _count_in(Lead, 'status') + _count_in(Work, 'stage')
+
+
+class StageMoveSerializer(serializers.Serializer):
+    direction = serializers.ChoiceField(choices=['up', 'down'])
+
+
+class PipelineStageViewSet(
+    mixins.ListModelMixin, mixins.CreateModelMixin, mixins.UpdateModelMixin, mixins.DestroyModelMixin,
+    viewsets.GenericViewSet,
+):
+    """Both pipelines' stages in the boards' order (?pipeline=LEAD or WORK for one). Every signed-in user reads them, as
+    every screen that shows a lead's status or a Work's stage names it. Only admins change them (Settings → Pipeline
+    Stages): add a stage (placed just before Won, or Completed), rename or move one of their own, and delete one of their
+    own, its records going to another stage first (destroy). System stages never change."""
+
+    serializer_class = PipelineStageSerializer
+    pagination_class = None
+    # No PUT: a stage's name is all that changes.
+    http_method_names = ['get', 'post', 'patch', 'delete', 'head', 'options']
+    lookup_value_regex = '[0-9]+'
+
+    def get_permissions(self):
+        return [IsAuthenticated()] if self.action == 'list' else [IsAdminRole()]
+
+    def get_queryset(self):
+        stages = PipelineStage.objects.filter(is_active=True)
+        pipeline = self.request.query_params.get('pipeline')
+        if self.action == 'list' and pipeline:
+            if pipeline not in Pipeline.values:
+                raise ValidationError({'pipeline': f'"{pipeline}" is not a valid choice.'})
+            stages = stages.filter(pipeline=pipeline)
+        # How many records each stage holds: for admins, who decide where they go before deleting it.
+        if self.request.user.role_id == Role.ADMIN:
+            stages = stages.annotate(record_count=RECORD_COUNT)
+        return stages
+
+    def pipeline_response(self, pipeline, status_code=status.HTTP_200_OK):
+        """The pipeline's stages after a change, so Settings shows the new order in one go."""
+        stages = self.get_queryset().filter(pipeline=pipeline)
+        return Response(self.get_serializer(stages, many=True).data, status=status_code)
+
+    def perform_create(self, serializer):
+        pipeline = serializer.validated_data['pipeline']
+        # Locked, so two admins adding stages at once number them one after the other.
+        stages = list(PipelineStage.objects.select_for_update().filter(pipeline=pipeline))
+        try:
+            with transaction.atomic():
+                # An opaque key: the name can change, the key stays (it is in every record and URL that uses the stage).
+                stage = serializer.save(key=f'CUSTOM_{uuid.uuid4().hex[:8].upper()}', is_system=False, order=len(stages))
+        except IntegrityError:
+            # The same name, added by someone else a moment ago.
+            raise ValidationError({'name': 'This pipeline already has a stage with this name.'}) from None
+        # renumber() keeps the last stages last, so the new stage lands just before them.
+        PipelineStage.renumber(pipeline, [*stages, stage])
+        transaction.on_commit(lambda: logger.warning(
+            'Pipeline stage %s "%s" (%s) added by user %s', stage.key, stage.name, pipeline, self.request.user.pk,
+        ))
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        self.perform_create(serializer)
+        return self.pipeline_response(serializer.instance.pipeline, status.HTTP_201_CREATED)
+
+    def perform_update(self, serializer):
+        if serializer.instance.is_system:
+            raise PermissionDenied("System stages can't be renamed.")
+        serializer.save()
+
+    @action(detail=True, methods=['post'])
+    def move(self, request, pk=None):
+        """Moves one of the admin's stages one place earlier ("up") or later ("down"), past any stage but the first and
+        the last ones. Answers the pipeline's stages."""
+        body = StageMoveSerializer(data=request.data)
+        body.is_valid(raise_exception=True)
+        stage = self.get_object()
+        if stage.is_system:
+            raise PermissionDenied("System stages can't be moved.")
+        stages = list(PipelineStage.objects.select_for_update().filter(pipeline=stage.pipeline))
+        index = next(i for i, other in enumerate(stages) if other.pk == stage.pk)
+        target = index - 1 if body.validated_data['direction'] == 'up' else index + 1
+        fixed = [FIRST_STAGE[stage.pipeline], *LAST_STAGES[stage.pipeline]]
+        if not 0 <= target < len(stages) or stages[target].key in fixed:
+            raise ValidationError({'direction': f'{stage.name} is already as far as it can go that way.'})
+        stages[index], stages[target] = stages[target], stages[index]
+        PipelineStage.renumber(stage.pipeline, stages)
+        return self.pipeline_response(stage.pipeline)
+
+    def destroy(self, request, *args, **kwargs):
+        """Deletes one of the admin's stages. One with records needs ?move_to=<key>: another open stage of the same
+        pipeline (not Won, Lost or Completed), where its records go first, in the same transaction. Without it the answer
+        is 409, with how many records the stage holds. Answers the pipeline's remaining stages."""
+        stage = self.get_object()
+        if stage.is_system:
+            raise PermissionDenied("System stages can't be deleted.")
+        move_to = request.query_params.get('move_to') or ''
+        # Both stages locked, in id order (as every deletion locks them, so two never deadlock), and before their records
+        # (as a record moving in locks its stage first: lock_stage). A record moving into this stage meanwhile commits
+        # first, and is counted and moved below.
+        locked = {
+            other.pk: other
+            for other in PipelineStage.objects.select_for_update().filter(
+                Q(pk=stage.pk) | Q(pipeline=stage.pipeline, key=move_to, is_active=True),
+            ).order_by('pk')
+        }
+        if stage.pk not in locked:
+            raise NotFound('This stage no longer exists.')
+        records = records_in(stage)
+        count = records.count()
+        destination = None
+        if count:
+            noun = ('lead' if count == 1 else 'leads') if stage.pipeline == Pipeline.LEAD else ('Work' if count == 1 else 'Works')
+            if not move_to:
+                return Response(
+                    {
+                        'detail': f'{count} {noun} {"is" if count == 1 else "are"} in {stage.name}. Choose the stage to '
+                                  f'move {"it" if count == 1 else "them"} to before deleting it.',
+                        'record_count': count,
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                )
+            destination = next((other for other in locked.values() if other.pk != stage.pk), None)
+            if destination is None or destination.key in LAST_STAGES[stage.pipeline]:
+                raise ValidationError({'move_to': f'Choose another open stage of the {stage.get_pipeline_display()}.'})
+            field = 'status' if stage.pipeline == Pipeline.LEAD else 'stage'
+            records.update(**{field: destination.key, 'updated_at': timezone.now()})
+        stage.delete()
+        PipelineStage.renumber(stage.pipeline)
+        transaction.on_commit(lambda: logger.warning(
+            'Pipeline stage %s "%s" (%s) deleted by user %s; %s records moved to %s', stage.key, stage.name,
+            stage.pipeline, request.user.pk, count, destination.key if destination else '-',
+        ))
+        return self.pipeline_response(stage.pipeline)

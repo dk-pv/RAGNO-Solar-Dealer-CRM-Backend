@@ -9,10 +9,69 @@ from apps.accounts.serializers import AssigneesSerializer
 from apps.activities.models import Activity, ActivityStatus
 from apps.activities.serializers import FollowUpSerializer
 
-from .models import Lead, LeadSource, LeadStatus, SolarPlan
+from .models import (
+    FIRST_STAGE, LAST_STAGES, Lead, LeadSource, LeadStatus, Pipeline, PipelineStage, SolarPlan, WorkType, stage_keys,
+)
 
 # assigned_to__name: by the first assignee's name (see filter_leads).
 ORDERINGS = ['name', 'created_at', 'status', 'amount', 'next_follow_up', 'plan__capacity', 'assigned_to__name']
+
+
+class StageField(serializers.CharField):
+    """A stage of one pipeline, by key: a key that isn't one of that pipeline's stages (unknown, deleted, or the other
+    pipeline's) is refused as an invalid choice, as the fixed choices were. No length limit of its own: only an existing
+    key passes, and keys run longer than 20 characters (SUBSIDY_DOCUMENTATION)."""
+
+    def __init__(self, pipeline, **kwargs):
+        self.pipeline = pipeline
+        super().__init__(**kwargs)
+
+    def to_internal_value(self, data):
+        key = super().to_internal_value(data)
+        if key not in stage_keys(self.pipeline):
+            raise serializers.ValidationError(f'"{key}" is not a valid choice.')
+        return key
+
+
+class PipelineStageSerializer(serializers.ModelSerializer):
+    """A pipeline stage as the boards and Settings → Pipeline Stages read it. Admins add a stage (pipeline and name) and
+    rename one of their own (name); the key is made by the API and never changes. `record_count`, the leads or Works in
+    the stage now, is for admins only (null for others)."""
+
+    name = serializers.CharField(max_length=50)
+    record_count = serializers.SerializerMethodField()
+    # What an admin can do with it: never rename, move or delete a system stage.
+    is_first = serializers.SerializerMethodField()
+    is_last = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PipelineStage
+        fields = ['id', 'pipeline', 'key', 'name', 'order', 'is_system', 'is_active', 'is_first', 'is_last', 'record_count']
+        read_only_fields = ['id', 'key', 'order', 'is_system', 'is_active']
+
+    def get_record_count(self, stage):
+        return getattr(stage, 'record_count', None)
+
+    def get_is_first(self, stage):
+        return stage.key == FIRST_STAGE[stage.pipeline]
+
+    def get_is_last(self, stage):
+        return stage.key in LAST_STAGES[stage.pipeline]
+
+    def validate_pipeline(self, pipeline):
+        if self.instance and pipeline != self.instance.pipeline:
+            raise serializers.ValidationError("A stage can't move to the other pipeline.")
+        return pipeline
+
+    def validate_name(self, value):
+        value = value.strip()
+        if not value:
+            raise serializers.ValidationError('Enter the stage name.')
+        pipeline = self.initial_data.get('pipeline') if self.instance is None else self.instance.pipeline
+        others = PipelineStage.objects.filter(pipeline=pipeline, name__iexact=value).exclude(pk=getattr(self.instance, 'pk', None))
+        if others.exists():
+            raise serializers.ValidationError('This pipeline already has a stage with this name.')
+        return value
 
 
 class SolarPlanSerializer(serializers.ModelSerializer):
@@ -88,7 +147,7 @@ class LeadSerializer(AssigneesSerializer, serializers.ModelSerializer):
         model = Lead
         fields = [
             'id', 'name', 'country_code', 'phone', 'email', 'state', 'district', 'area', 'pin_code', 'dealer_name',
-            'plan', 'plan_name', 'amount', 'status', 'allowed_transitions', 'source',
+            'plan', 'plan_name', 'amount', 'work_type', 'status', 'allowed_transitions', 'source',
             'assignee_ids', 'assignees', 'assigned_to', 'assigned_to_name', 'next_follow_up', 'notes', 'is_pinned', 'work',
             'can_edit', 'can_delete', 'can_assign', 'can_convert', 'created_by_name', 'created_at', 'updated_at',
             'initial_follow_up',
@@ -107,7 +166,10 @@ class LeadSerializer(AssigneesSerializer, serializers.ModelSerializer):
         request = self.context.get('request')
         if request and not request.user.has_perm('leads.change_lead'):
             return []
-        return lead.allowed_transitions()
+        # The pipeline's order, read once for a whole page of leads (a list's rows share the root's context).
+        if 'open_lead_stages' not in self.context:
+            self.context['open_lead_stages'] = stage_keys(Pipeline.LEAD, open_only=True)
+        return lead.allowed_transitions(self.context['open_lead_stages'])
 
     def validate_phone(self, value):
         number = re.sub(r'[\s().-]', '', value)
@@ -186,7 +248,7 @@ class LeadSerializer(AssigneesSerializer, serializers.ModelSerializer):
 
 
 class StatusChangeSerializer(serializers.Serializer):
-    status = serializers.ChoiceField(choices=LeadStatus.choices)
+    status = StageField(Pipeline.LEAD)
 
 
 class BulkIdsSerializer(serializers.Serializer):
@@ -199,17 +261,22 @@ class BulkIdsSerializer(serializers.Serializer):
 
 
 class BulkStatusSerializer(BulkIdsSerializer):
-    status = serializers.ChoiceField(choices=LeadStatus.choices)
+    status = StageField(Pipeline.LEAD)
+
+
+# A work type filter: one of the types, or "none" for records without one.
+WORK_TYPE_FILTER = [*WorkType.values, 'none']
 
 
 class LeadQuerySerializer(serializers.Serializer):
     """The list's query parameters: an unknown status or a malformed date is a 400, never a silently ignored filter."""
 
     search = serializers.CharField(required=False, allow_blank=True)
-    status = serializers.ChoiceField(choices=LeadStatus.choices, required=False)
+    status = StageField(Pipeline.LEAD, required=False)
     plan = serializers.IntegerField(required=False)
     assigned_to = serializers.IntegerField(required=False)
     source = serializers.ChoiceField(choices=LeadSource.choices, required=False)
+    work_type = serializers.ChoiceField(choices=WORK_TYPE_FILTER, required=False)
     created_after = serializers.DateField(required=False)
     created_before = serializers.DateField(required=False)
     ordering = serializers.ChoiceField(choices=[*ORDERINGS, *(f'-{field}' for field in ORDERINGS)], required=False)

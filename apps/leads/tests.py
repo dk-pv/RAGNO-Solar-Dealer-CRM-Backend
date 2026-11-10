@@ -385,7 +385,9 @@ class LeadApiTests(APITestCase):
         self.assertEqual(rows[0][:4], ['Lead ID', 'Customer', 'Country code', 'Phone'])
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[1][1:4], ['\'=HYPERLINK("http://example.com")', '91', '9876543210'])
-        self.assertEqual(rows[1][12], 'Hot')
+        # The work type (none here) comes before the status.
+        self.assertEqual(rows[0][12:14], ['Work type', 'Status'])
+        self.assertEqual(rows[1][12:14], ['', 'Hot'])
 
     def test_assignees_are_active_users_with_only_their_names(self):
         User.objects.create_user(email='gone@example.com', password=PASSWORD, name='Gone', is_active=False)

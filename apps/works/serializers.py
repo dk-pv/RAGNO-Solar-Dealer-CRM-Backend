@@ -1,10 +1,11 @@
 from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
-from apps.leads.serializers import BulkIdsSerializer  # noqa: F401 (the Works views take it from here)
+from apps.leads.models import Pipeline
+from apps.leads.serializers import WORK_TYPE_FILTER, BulkIdsSerializer, StageField  # noqa: F401 (BulkIdsSerializer: for the Works views)
 
-from .documents import summarize
-from .models import Work, WorkDocument, WorkStage
+from .documents import ADDITIONAL_CATEGORIES, summarize
+from .models import Work, WorkDocument
 
 User = get_user_model()
 
@@ -18,6 +19,8 @@ class WorkSerializer(serializers.ModelSerializer):
         required=False,
         allow_null=True,
     )
+    # Any Work stage, an admin's included; never a lead's.
+    stage = StageField(Pipeline.WORK, required=False)
     plan_name = serializers.SerializerMethodField()
     # What the customer pays: offer_amount when an admin applied an offer, otherwise `amount`, the standard price.
     effective_amount = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
@@ -33,14 +36,14 @@ class WorkSerializer(serializers.ModelSerializer):
         model = Work
         fields = [
             'id', 'lead', 'customer_name', 'country_code', 'phone', 'email', 'state', 'district', 'area', 'pin_code',
-            'plan', 'plan_name', 'amount', 'offer_amount', 'offer_note', 'effective_amount', 'stage', 'assigned_to',
+            'plan', 'plan_name', 'amount', 'offer_amount', 'offer_note', 'effective_amount', 'work_type', 'stage', 'assigned_to',
             'assigned_to_name', 'due_date', 'is_pinned', 'activity_count', 'pending_activity_count',
             'next_activity_due', 'document_summary', 'created_at', 'updated_at',
         ]
         # The customer, plan and confirmed amount are the job's record from conversion: only the pipeline fields, the
-        # pin and the email change. The email is one of the required documents (Email ID), so a Work converted without
-        # one can still be completed; it is validated as a lead's is. An offer changes only through the offer action
-        # (admins).
+        # pin, the work type and the email change. The email is one of the required documents (Email ID), so a Work
+        # converted without one can still be completed; it is validated as a lead's is. An offer changes only through
+        # the offer action (admins).
         read_only_fields = [
             'id', 'lead', 'customer_name', 'country_code', 'phone', 'state', 'district', 'area', 'pin_code',
             'plan', 'amount', 'offer_amount', 'offer_note', 'created_at', 'updated_at',
@@ -86,16 +89,17 @@ class OfferSerializer(serializers.Serializer):
 
 
 class BulkStageSerializer(BulkIdsSerializer):
-    stage = serializers.ChoiceField(choices=WorkStage.choices)
+    stage = StageField(Pipeline.WORK)
 
 
 class WorkQuerySerializer(serializers.Serializer):
     """The list's query parameters: an unknown stage or ordering is a 400, never a silently ignored filter."""
 
     search = serializers.CharField(required=False, allow_blank=True)
-    stage = serializers.ChoiceField(choices=WorkStage.choices, required=False)
+    stage = StageField(Pipeline.WORK, required=False)
     assigned_to = serializers.IntegerField(required=False)
     plan = serializers.IntegerField(required=False)
+    work_type = serializers.ChoiceField(choices=WORK_TYPE_FILTER, required=False)
     created_after = serializers.DateField(required=False)
     created_before = serializers.DateField(required=False)
     ordering = serializers.ChoiceField(choices=[*ORDERINGS, *(f'-{field}' for field in ORDERINGS)], required=False)
@@ -109,3 +113,21 @@ class WorkDocumentSerializer(serializers.ModelSerializer):
     class Meta:
         model = WorkDocument
         fields = ['original_filename', 'content_type', 'file_size', 'uploaded_at', 'uploaded_by_name']
+
+
+class AdditionalDocumentSerializer(WorkDocumentSerializer):
+    """An additional document: as a required one is shown, with its id (its URLs use it), title, category and
+    description."""
+
+    category_label = serializers.CharField(source='get_category_display', read_only=True)
+
+    class Meta(WorkDocumentSerializer.Meta):
+        fields = ['id', 'title', 'category', 'category_label', 'description', *WorkDocumentSerializer.Meta.fields]
+
+
+class AdditionalUploadSerializer(serializers.Serializer):
+    """An additional document's details, sent with its file (multipart). Checked before the file is stored."""
+
+    title = serializers.CharField(max_length=150)
+    category = serializers.ChoiceField(choices=ADDITIONAL_CATEGORIES, default='OTHER')
+    description = serializers.CharField(max_length=1000, required=False, allow_blank=True, default='')
